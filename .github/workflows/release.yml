@@ -18,6 +18,10 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual fallback: publishes whatever version Cargo.toml carries on the
+  # chosen branch (crates.io rejects re-publishing an existing version, so
+  # a stray dispatch cannot clobber anything).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,8 +40,12 @@ jobs:
 
       - name: Tag matches Cargo.toml version
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
           CRATE=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "manual dispatch: publishing $CRATE from $GITHUB_REF_NAME"
+            exit 0
+          fi
+          TAG="${GITHUB_REF_NAME#v}"
           if [ "$TAG" != "$CRATE" ]; then
             echo "tag v$TAG does not match Cargo.toml version $CRATE" >&2
             exit 1
