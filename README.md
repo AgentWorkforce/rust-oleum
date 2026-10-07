@@ -15,9 +15,6 @@ Existing debt is grandfathered. New debt fails the build. The baseline only shri
 cargo install rust-oleum
 ```
 
-> Until the first crates.io release lands:
-> `cargo install --locked --git https://github.com/AgentWorkforce/rust-oleum`
-
 ## Use
 
 ```sh

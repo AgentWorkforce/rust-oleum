@@ -1,55 +1,79 @@
 name: Release
 
-# Publishes to crates.io via Trusted Publishing (OIDC) when a version tag
-# is pushed. No long-lived token lives in this repo: the job mints a
-# short-lived one from its GitHub OIDC identity, which crates.io accepts
-# once the crate's Trusted Publishing settings point at this repo and
-# workflow file.
+# Publish to crates.io from the Actions UI, like burn's publish workflow:
+# pick a version bump (or give an exact version), optionally dry-run.
+# The job bumps Cargo.toml, runs the tests and the quality gate, publishes
+# via crates.io Trusted Publishing (OIDC — no stored token), then commits
+# the bump, tags v<version>, and creates a GitHub release.
 #
-# One-time setup (after the first manual `cargo publish`):
-#   crates.io -> rust-oleum -> Settings -> Trusted Publishing -> New
-#     repository owner: AgentWorkforce
-#     repository name:  rust-oleum
-#     workflow file:    release.yml
-#
-# Releasing: bump `version` in Cargo.toml, commit, tag `v<version>`, push
-# the tag.
+# crates.io -> rust-oleum -> Settings -> Trusted Publishing must point at
+# this repository and workflow file (release.yml).
 
 on:
-  push:
-    tags: ['v*']
-  # Manual fallback: publishes whatever version Cargo.toml carries on the
-  # chosen branch (crates.io rejects re-publishing an existing version, so
-  # a stray dispatch cannot clobber anything).
   workflow_dispatch:
+    inputs:
+      version:
+        description: Version bump
+        type: choice
+        options: [patch, minor, major, none]
+        default: patch
+      custom_version:
+        description: Exact version (overrides bump), e.g. 0.3.1
+        type: string
+        required: false
+      dry_run:
+        description: Validate everything without publishing or tagging
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
       id-token: write # mint the OIDC token for crates.io
-      contents: read
+      contents: write # push the version-bump commit + tag
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Rust
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: rustup toolchain install stable --profile minimal
 
-      - name: Tag matches Cargo.toml version
+      - name: Resolve target version
+        id: version
+        env:
+          BUMP: ${{ inputs.version }}
+          CUSTOM: ${{ inputs.custom_version }}
         run: |
-          CRATE=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-            echo "manual dispatch: publishing $CRATE from $GITHUB_REF_NAME"
-            exit 0
+          CURRENT=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ -n "$CUSTOM" ]; then
+            NEW="$CUSTOM"
+          elif [ "$BUMP" = "none" ]; then
+            NEW="$CURRENT"
+          else
+            IFS=. read -r MA MI PA <<< "$CURRENT"
+            case "$BUMP" in
+              major) NEW="$((MA + 1)).0.0" ;;
+              minor) NEW="$MA.$((MI + 1)).0" ;;
+              patch) NEW="$MA.$MI.$((PA + 1))" ;;
+            esac
           fi
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$TAG" != "$CRATE" ]; then
-            echo "tag v$TAG does not match Cargo.toml version $CRATE" >&2
-            exit 1
-          fi
+          echo "releasing $CURRENT -> $NEW"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Apply version
+        env:
+          NEW: ${{ steps.version.outputs.new }}
+        run: |
+          sed -i "0,/^version = \".*\"/s//version = \"$NEW\"/" Cargo.toml
+          grep -m1 '^version' Cargo.toml
+          cargo update --workspace
 
       - name: Test
         run: cargo test
@@ -57,11 +81,38 @@ jobs:
       - name: Gate
         run: cargo run --
 
+      - name: Commit release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git diff --quiet || git commit -am "Release v${{ steps.version.outputs.new }}"
+
+      - name: Publish (dry run)
+        if: inputs.dry_run
+        run: cargo publish --dry-run --locked
+
       - name: Authenticate with crates.io
+        if: ${{ !inputs.dry_run }}
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish
+        if: ${{ !inputs.dry_run }}
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Push bump and tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git tag "v${{ steps.version.outputs.new }}"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "v${{ steps.version.outputs.new }}"
+
+      - name: Create GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "v${{ steps.version.outputs.new }}"
+          --title "v${{ steps.version.outputs.new }}"
+          --generate-notes
