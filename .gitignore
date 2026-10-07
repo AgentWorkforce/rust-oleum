@@ -1,0 +1,6 @@
+/target
+mutants.out/
+mutants.out.old/
+lcov.info
+clippy-log.json
+oleum-report.json
