@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::{config, coverage, rust_metrics, ts_metrics};
+use crate::{config, coverage, rust_metrics};
 
 pub const CONFIG_FILE: &str = "rust-oleum.toml";
 
@@ -31,8 +31,6 @@ crap_max = 25.0
 surviving_mutants_max = 0
 dead_code_max = 0
 redundant_code_max = 0
-ts_any_max = 0
-ts_unknown_max = 0
 ";
 
 pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Result<()> {
@@ -41,36 +39,34 @@ pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Resul
         bail!("{CONFIG_FILE} already exists; pass --force to regenerate it");
     }
 
-    let (rust_roots, ts_roots) = detect_roots(repo_root)?;
-    if rust_roots.is_empty() && ts_roots.is_empty() {
-        bail!("no source roots found under {} (looked for src/ directories next to Cargo.toml / package.json)", repo_root.display());
+    let rust_roots = detect_roots(repo_root)?;
+    if rust_roots.is_empty() {
+        bail!(
+            "no source roots found under {} (looked for src/ directories next to a Cargo.toml)",
+            repo_root.display()
+        );
     }
 
     let mut text = format!(
-        "{HEADER}\n{DEFAULT_TARGETS}\n[sources]\nrust_roots = {}\nts_roots = {}\n\n",
+        "{HEADER}\n{DEFAULT_TARGETS}\n[sources]\nrust_roots = {}\n\n",
         toml_array(&rust_roots),
-        toml_array(&ts_roots),
     );
     let cfg: config::Config = toml::from_str(&text).context("building default config")?;
 
     let rust = rust_metrics::collect(repo_root, &cfg.sources.rust_roots)?;
-    let ts = ts_metrics::collect(repo_root, &cfg.sources.ts_roots)?;
     let cov = coverage_file
         .map(|p| coverage::Coverage::from_lcov(p, repo_root))
         .transpose()?;
     let coverage_pct = cov.as_ref().map(coverage::Coverage::total_line_coverage);
     let crap = cov.as_ref().map(|c| c.crap_scores(&rust.functions));
 
-    let baseline = baseline_toml(&cfg, &rust, &ts, coverage_pct, crap.as_deref());
+    let baseline = baseline_toml(&cfg, &rust, coverage_pct, crap.as_deref());
     let grandfathered = baseline.lines().filter(|l| l.contains('=')).count();
     text.push_str(&baseline);
     std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
 
     println!("wrote {CONFIG_FILE}");
     println!("  rust roots: {}", rust_roots.join(", "));
-    if !ts_roots.is_empty() {
-        println!("  ts roots:   {}", ts_roots.join(", "));
-    }
     println!(
         "  measured {} files, {} functions; grandfathered {} baseline entries",
         rust.files.len(),
@@ -87,11 +83,9 @@ fn toml_array(items: &[String]) -> String {
 }
 
 /// Source roots: `src/` directories that sit next to a `Cargo.toml`
-/// (Rust) or a `package.json`/`tsconfig.json` (TypeScript) and contain
-/// matching sources.
-fn detect_roots(repo_root: &Path) -> Result<(Vec<String>, Vec<String>)> {
+/// and contain Rust sources.
+fn detect_roots(repo_root: &Path) -> Result<Vec<String>> {
     let mut rust = Vec::new();
-    let mut ts = Vec::new();
     let mut stack = vec![repo_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in
@@ -102,15 +96,16 @@ fn detect_roots(repo_root: &Path) -> Result<(Vec<String>, Vec<String>)> {
                 continue;
             }
             if path.file_name().is_some_and(|n| n == "src") {
-                classify_src(&path, repo_root, &mut rust, &mut ts);
+                if let Some(rel) = rust_src_root(&path, repo_root) {
+                    rust.push(rel);
+                }
             } else {
                 stack.push(path);
             }
         }
     }
     rust.sort();
-    ts.sort();
-    Ok((rust, ts))
+    Ok(rust)
 }
 
 fn skip_dir(path: &Path) -> bool {
@@ -120,21 +115,17 @@ fn skip_dir(path: &Path) -> bool {
     name.starts_with('.') || matches!(name, "target" | "node_modules" | "dist" | "vendor")
 }
 
-fn classify_src(src: &Path, repo_root: &Path, rust: &mut Vec<String>, ts: &mut Vec<String>) {
-    let Some(parent) = src.parent() else { return };
-    let rel = src
-        .strip_prefix(repo_root)
-        .unwrap_or(src)
-        .to_string_lossy()
-        .replace('\\', "/");
-    if parent.join("Cargo.toml").exists() && contains_ext(src, &["rs"]) {
-        rust.push(rel.clone());
+fn rust_src_root(src: &Path, repo_root: &Path) -> Option<String> {
+    let parent = src.parent()?;
+    if !parent.join("Cargo.toml").exists() || !contains_ext(src, &["rs"]) {
+        return None;
     }
-    if (parent.join("package.json").exists() || parent.join("tsconfig.json").exists())
-        && contains_ext(src, &["ts", "mts", "cts"])
-    {
-        ts.push(rel);
-    }
+    Some(
+        src.strip_prefix(repo_root)
+            .unwrap_or(src)
+            .to_string_lossy()
+            .replace('\\', "/"),
+    )
 }
 
 fn contains_ext(dir: &Path, exts: &[&str]) -> bool {
@@ -162,7 +153,6 @@ fn contains_ext(dir: &Path, exts: &[&str]) -> bool {
 pub fn baseline_toml(
     config: &config::Config,
     rust: &rust_metrics::RustMetrics,
-    ts: &ts_metrics::TsTypeCounts,
     coverage_pct: Option<f64>,
     crap: Option<&[coverage::CrapScore]>,
 ) -> String {
@@ -176,10 +166,6 @@ pub fn baseline_toml(
             let _ = writeln!(out, "coverage_min_pct = {:.1}", (pct - 0.5).max(0.0));
         }
     }
-    if ts.unknown_count > t.ts_unknown_max {
-        let _ = writeln!(out, "ts_unknown_max = {}", ts.unknown_count);
-    }
-
     let mut section = |name: &str, entries: Vec<(String, String)>| {
         if entries.is_empty() {
             return;
@@ -267,8 +253,6 @@ mod tests {
         };
         w("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
         w("crates/a/src/lib.rs", "fn tidy() {}\n");
-        w("packages/p/package.json", "{}\n");
-        w("packages/p/src/i.ts", "let n: number = 1;\n");
         // Decoys that must not become roots.
         w("crates/a/target/src/gen.rs", "fn t() {}\n");
         w("docs/src/guide.md", "# not code\n");
@@ -279,9 +263,8 @@ mod tests {
     fn detects_manifest_adjacent_src_roots() {
         let dir = tempfile::tempdir().unwrap();
         fake_project(dir.path());
-        let (rust, ts) = detect_roots(dir.path()).unwrap();
+        let rust = detect_roots(dir.path()).unwrap();
         assert_eq!(rust, vec!["crates/a/src"]);
-        assert_eq!(ts, vec!["packages/p/src"]);
     }
 
     #[test]

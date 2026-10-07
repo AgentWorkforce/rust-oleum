@@ -2,7 +2,7 @@
 //!
 //! Measures a codebase against the targets in `rust-oleum.toml` (complexity,
 //! Halstead difficulty, file size, coverage, CRAP, mutants, dead/redundant
-//! code, TS `any`/`unknown`) and exits non-zero when the enforced gate fails.
+//! code) and exits non-zero when the enforced gate fails.
 //! Existing violations are grandfathered in a `[baseline]` section that may
 //! only shrink: new violations and regressions fail, today's debt doesn't.
 
@@ -14,7 +14,6 @@ mod init;
 mod loc;
 mod report;
 mod rust_metrics;
-mod ts_metrics;
 
 use std::path::PathBuf;
 
@@ -88,7 +87,6 @@ fn main() -> Result<()> {
 
     let config = config::Config::load(&repo_root.join(&args.config))?;
     let rust = rust_metrics::collect(&repo_root, &config.sources.rust_roots)?;
-    let ts = ts_metrics::collect(&repo_root, &config.sources.ts_roots)?;
 
     let cov = args
         .coverage
@@ -112,7 +110,7 @@ fn main() -> Result<()> {
     if args.write_baseline {
         print!(
             "{}",
-            init::baseline_toml(&config, &rust, &ts, coverage_pct, crap.as_deref())
+            init::baseline_toml(&config, &rust, coverage_pct, crap.as_deref())
         );
         return Ok(());
     }
@@ -120,7 +118,6 @@ fn main() -> Result<()> {
     let report = report::build(
         &config,
         &rust,
-        &ts,
         coverage_pct,
         crap.as_deref(),
         lints.as_ref(),

@@ -32,8 +32,6 @@ pub struct Targets {
     pub surviving_mutants_max: usize,
     pub dead_code_max: usize,
     pub redundant_code_max: usize,
-    pub ts_any_max: usize,
-    pub ts_unknown_max: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -41,8 +39,6 @@ pub struct Targets {
 pub struct Baseline {
     /// Enforced coverage floor while below the 100% target.
     pub coverage_min_pct: Option<f64>,
-    /// Enforced ceiling for `unknown` usages in the TS surface.
-    pub ts_unknown_max: Option<usize>,
     /// file path -> allowed LOC ceiling.
     #[serde(default)]
     pub file_loc: BTreeMap<String, usize>,
@@ -65,8 +61,6 @@ pub struct Baseline {
 pub struct Sources {
     /// Roots scanned for production Rust code.
     pub rust_roots: Vec<String>,
-    /// Roots scanned for TypeScript.
-    pub ts_roots: Vec<String>,
 }
 
 impl Config {

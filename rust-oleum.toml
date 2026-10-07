@@ -13,11 +13,8 @@ crap_max = 25.0
 surviving_mutants_max = 0
 dead_code_max = 0
 redundant_code_max = 0
-ts_any_max = 0
-ts_unknown_max = 0
 
 [sources]
 rust_roots = ["src"]
-ts_roots = []
 
 [baseline]

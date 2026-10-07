@@ -8,7 +8,6 @@ use crate::config::{function_key, Config};
 use crate::coverage::CrapScore;
 use crate::external::{LintCounts, MutantCounts};
 use crate::rust_metrics::RustMetrics;
-use crate::ts_metrics::TsTypeCounts;
 
 #[derive(Debug, serde::Serialize)]
 pub struct MetricRow {
@@ -78,7 +77,6 @@ fn check_items<V: PartialOrd + Copy + std::fmt::Display>(
 pub fn build(
     config: &Config,
     rust: &RustMetrics,
-    ts: &TsTypeCounts,
     coverage_pct: Option<f64>,
     crap: Option<&[CrapScore]>,
     lints: Option<&LintCounts>,
@@ -90,7 +88,6 @@ pub fn build(
     crap_row(config, crap, &mut report);
     mutants_row(config, mutants, &mut report);
     lint_rows(config, lints, &mut report);
-    ts_rows(config, ts, &mut report);
     report
 }
 
@@ -310,45 +307,6 @@ fn lint_rows(config: &Config, lints: Option<&LintCounts>, report: &mut Report) {
     );
 }
 
-fn ts_rows(config: &Config, ts: &TsTypeCounts, report: &mut Report) {
-    let t = &config.targets;
-    if ts.any_count > t.ts_any_max {
-        report.violations.push(format!(
-            "ts any: {} usages (max {})",
-            ts.any_count, t.ts_any_max
-        ));
-    }
-    report.push_row(
-        "ts any",
-        MetricRow {
-            metric: "TS `any` types".into(),
-            value: ts.any_count.to_string(),
-            target: format!("<= {}", t.ts_any_max),
-            meets_target: ts.any_count <= t.ts_any_max,
-            passes_gate: true,
-            detail: String::new(),
-        },
-    );
-    let unknown_ceiling = config.baseline.ts_unknown_max.unwrap_or(t.ts_unknown_max);
-    if ts.unknown_count > unknown_ceiling {
-        report.violations.push(format!(
-            "ts unknown: {} usages exceed the enforced ceiling {}",
-            ts.unknown_count, unknown_ceiling
-        ));
-    }
-    report.push_row(
-        "ts unknown",
-        MetricRow {
-            metric: "TS `unknown` types".into(),
-            value: ts.unknown_count.to_string(),
-            target: format!("<= {}", t.ts_unknown_max),
-            meets_target: ts.unknown_count <= t.ts_unknown_max,
-            passes_gate: true,
-            detail: format!("enforced ceiling: {unknown_ceiling}"),
-        },
-    );
-}
-
 fn not_measured(metric: &str, target: &str, detail: &str) -> MetricRow {
     MetricRow {
         metric: metric.into(),
@@ -454,7 +412,6 @@ mod tests {
     use crate::coverage::CrapScore;
     use crate::external::{LintCounts, MutantCounts};
     use crate::rust_metrics::{FileMetrics, FunctionMetrics, RustMetrics};
-    use crate::ts_metrics::TsTypeCounts;
 
     fn test_config() -> Config {
         Config {
@@ -468,22 +425,16 @@ mod tests {
                 surviving_mutants_max: 0,
                 dead_code_max: 0,
                 redundant_code_max: 0,
-                ts_any_max: 0,
-                ts_unknown_max: 0,
             },
             baseline: Baseline {
                 coverage_min_pct: Some(80.0),
-                ts_unknown_max: Some(2),
                 file_loc: BTreeMap::from([("big.rs".to_string(), 150)]),
                 cyclomatic: BTreeMap::new(),
                 cognitive: BTreeMap::new(),
                 halstead: BTreeMap::new(),
                 crap: BTreeMap::new(),
             },
-            sources: Sources {
-                rust_roots: vec![],
-                ts_roots: vec![],
-            },
+            sources: Sources { rust_roots: vec![] },
         }
     }
 
@@ -516,11 +467,6 @@ mod tests {
             // Exactly at target: passes; one above: new violation.
             functions: vec![fn_metric("at_limit", 10), fn_metric("over", 11)],
         };
-        let ts = TsTypeCounts {
-            any_count: 0,
-            unknown_count: 2,
-            per_file: vec![],
-        };
         let crap = vec![CrapScore {
             file: "a.rs".into(),
             name: "over".into(),
@@ -544,14 +490,13 @@ mod tests {
         let report = build(
             &config,
             &rust,
-            &ts,
             Some(80.0),
             Some(&crap),
             Some(&lints),
             Some(&mutants),
         );
 
-        assert_eq!(report.rows.len(), 11);
+        assert_eq!(report.rows.len(), 9);
         let row = |m: &str| report.rows.iter().find(|r| r.metric.contains(m)).unwrap();
 
         // cyclomatic: "over" (11) is a new violation; "at_limit" (10) is not.
@@ -585,12 +530,6 @@ mod tests {
         assert!(!row("Redundant").meets_target);
         assert!(!row("Redundant").passes_gate);
 
-        // ts: any 0 passes; unknown 2 misses the target but sits at the
-        // enforced ceiling.
-        assert!(row("`any`").meets_target);
-        assert!(!row("`unknown`").meets_target);
-        assert!(row("`unknown`").passes_gate);
-
         assert!(!report.gate_passed());
         let table = render_table(&report);
         assert!(table.contains("Cyclomatic complexity (per fn)"));
@@ -608,8 +547,7 @@ mod tests {
             }],
             functions: vec![fn_metric("small", 1)],
         };
-        let ts = TsTypeCounts::default();
-        let report = build(&config, &rust, &ts, Some(100.0), None, None, None);
+        let report = build(&config, &rust, Some(100.0), None, None, None);
         assert!(report.gate_passed());
         assert!(report.violations.is_empty());
         let cov = report
@@ -619,7 +557,7 @@ mod tests {
             .unwrap();
         assert!(cov.meets_target);
         // Coverage below the floor is a violation.
-        let report = build(&config, &rust, &ts, Some(79.9), None, None, None);
+        let report = build(&config, &rust, Some(79.9), None, None, None);
         assert!(!report.gate_passed());
         assert!(report.violations[0].contains("below the enforced floor"));
     }
@@ -648,11 +586,10 @@ mod tests {
         let mut config = test_config();
         config.baseline.coverage_min_pct = Some(80.0);
         let rust = RustMetrics::default();
-        let ts = TsTypeCounts::default();
-        let report = build(&config, &rust, &ts, Some(80.0), None, None, None);
+        let report = build(&config, &rust, Some(80.0), None, None, None);
         assert!(report.gate_passed());
         // Exactly at the 100% target meets the target too.
-        let report = build(&config, &rust, &ts, Some(100.0), None, None, None);
+        let report = build(&config, &rust, Some(100.0), None, None, None);
         let cov = report
             .rows
             .iter()
@@ -665,11 +602,6 @@ mod tests {
     fn each_scalar_metric_violates_above_its_max() {
         let config = test_config();
         let rust = RustMetrics::default();
-        let ts = TsTypeCounts {
-            any_count: 1,
-            unknown_count: 0,
-            per_file: vec![],
-        };
         let lints = LintCounts {
             dead_code: 1,
             redundant: 0,
@@ -683,32 +615,21 @@ mod tests {
             unviable: 0,
             missed_examples: vec!["m".into()],
         };
-        let report = build(
-            &config,
-            &rust,
-            &ts,
-            None,
-            None,
-            Some(&lints),
-            Some(&mutants),
-        );
-        assert!(report.violations.iter().any(|v| v.starts_with("ts any:")));
+        let report = build(&config, &rust, None, None, Some(&lints), Some(&mutants));
         assert!(report
             .violations
             .iter()
             .any(|v| v.starts_with("dead code:")));
         assert!(report.violations.iter().any(|v| v.starts_with("mutants:")));
         assert!(!report.violations.iter().any(|v| v.starts_with("redundant")));
-        assert_eq!(report.violations.len(), 3);
+        assert_eq!(report.violations.len(), 2);
 
         // All-zero inputs produce no violations at zero maxima.
         let clean_lints = LintCounts::default();
         let clean_mutants = MutantCounts::default();
-        let clean_ts = TsTypeCounts::default();
         let report = build(
             &config,
             &rust,
-            &clean_ts,
             None,
             None,
             Some(&clean_lints),

@@ -4,7 +4,7 @@
 
 **A protective coating for your codebase.**
 
-A code-quality ratchet for Rust (and TypeScript) codebases.
+A code-quality ratchet for Rust codebases.
 Existing debt is grandfathered. New debt fails the build. The baseline only shrinks.
 
 </div>
@@ -37,7 +37,6 @@ ratchet tightens — it never loosens.
 | Cognitive complexity | ≤ 22 per function | source |
 | Halstead difficulty | ≤ 80 per function | source |
 | Lines of code | ≤ 500 per file | source |
-| TS `any` / `unknown` types | 0 | source |
 | Test coverage | 100% | `--coverage` lcov file |
 | CRAP score | ≤ 25 per function | `--coverage` lcov file |
 | Dead code | 0 findings | `--clippy-log` JSON |
