@@ -1,0 +1,59 @@
+name: Release
+
+# Publishes to crates.io via Trusted Publishing (OIDC) when a version tag
+# is pushed. No long-lived token lives in this repo: the job mints a
+# short-lived one from its GitHub OIDC identity, which crates.io accepts
+# once the crate's Trusted Publishing settings point at this repo and
+# workflow file.
+#
+# One-time setup (after the first manual `cargo publish`):
+#   crates.io -> rust-oleum -> Settings -> Trusted Publishing -> New
+#     repository owner: AgentWorkforce
+#     repository name:  rust-oleum
+#     workflow file:    release.yml
+#
+# Releasing: bump `version` in Cargo.toml, commit, tag `v<version>`, push
+# the tag.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # mint the OIDC token for crates.io
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Tag matches Cargo.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "tag v$TAG does not match Cargo.toml version $CRATE" >&2
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test
+
+      - name: Gate
+        run: cargo run --
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
