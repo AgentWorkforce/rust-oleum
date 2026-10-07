@@ -2,7 +2,7 @@
 
 # Rust-Oleum
 
-**Stops the rust before it spreads.**
+**A protective coating for your codebase.**
 
 A code-quality ratchet for Rust (and TypeScript) codebases.
 Existing debt is grandfathered. New debt fails the build. The baseline only shrinks.

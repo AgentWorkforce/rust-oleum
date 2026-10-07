@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.82"
 license = "Apache-2.0"
 repository = "https://github.com/AgentWorkforce/rust-oleum"
-description = "Stops the rust before it spreads: a code-quality ratchet gate for Rust (and TypeScript) codebases — complexity, coverage, CRAP, mutants, dead code — enforced in CI with a shrinking baseline."
+description = "A protective coating for your codebase: a code-quality ratchet gate for Rust (and TypeScript) — complexity, coverage, CRAP, mutants, dead code — enforced in CI with a shrinking baseline."
 keywords = ["quality", "ci", "complexity", "coverage", "lint"]
 categories = ["development-tools", "development-tools::testing"]
 

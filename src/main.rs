@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "rust-oleum",
     version,
-    about = "Stops the rust before it spreads: a code-quality ratchet gate"
+    about = "A protective coating for your codebase: a code-quality ratchet gate"
 )]
 struct Args {
     #[command(subcommand)]
