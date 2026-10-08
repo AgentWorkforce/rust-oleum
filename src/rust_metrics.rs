@@ -1,12 +1,18 @@
 //! Source-level metrics for Rust production code: per-function cyclomatic
-//! complexity, cognitive complexity (Sonar-style approximation), Halstead
-//! difficulty, and per-file logical lines of code.
+//! complexity (McCabe) and cognitive complexity (SonarSource), both scored by
+//! [`cccc-rs`](https://github.com/moznion/cccc); Halstead difficulty; and
+//! per-file logical lines of code.
+//!
+//! cccc reports closures and nested `fn`s as children of their enclosing
+//! function. We fold them back into the named function that contains them,
+//! so each named fn stays one gated entry with a stable baseline key.
 //!
 //! Test code (`tests/` dirs, `*_tests.rs` / `tests.rs` files, `#[cfg(test)]`
 //! modules, `#[test]` functions) is excluded: the benchmark measures the
 //! shipping surface, and test tables/fixtures legitimately trade these
 //! metrics for readability.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -78,6 +84,8 @@ pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics>
         let mut visitor = FnVisitor {
             file: rel,
             scope: Vec::new(),
+            in_test_mod: false,
+            scores: cccc_scores(&path, &src),
             functions: &mut out.functions,
         };
         visitor.visit_file(&ast);
@@ -142,25 +150,67 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
         || is_cfg_test(attrs)
 }
 
+/// `(cyclomatic, cognitive)` per function, keyed by `(ident line, name)` —
+/// the line of the fn's name, which is how cccc locates a function. Same-key
+/// functions (e.g. two `fn new` on one unformatted line) queue in source
+/// order, the order both walks visit them.
+type Scores = HashMap<(usize, String), VecDeque<(u32, u32)>>;
+
+/// Score a file with cccc, folding closures and nested fns into the
+/// top-level function that contains them.
+fn cccc_scores(path: &Path, src: &str) -> Scores {
+    let mut scores = Scores::new();
+    for f in &cccc_rs::analyze_source(path, src).functions {
+        scores
+            .entry((f.line as usize, f.name.clone()))
+            .or_default()
+            .push_back(folded(f));
+    }
+    scores
+}
+
+/// A function's own scores plus every descendant's. Each child's McCabe
+/// base of 1 is dropped: a closure adds its decision points, not a path.
+fn folded(f: &cccc_core::report::FunctionReport) -> (u32, u32) {
+    f.children
+        .iter()
+        .map(folded)
+        .fold((f.cyclomatic, f.cognitive), |(cyc, cog), (c_cyc, c_cog)| {
+            (cyc + c_cyc - 1, cog + c_cog)
+        })
+}
+
 struct FnVisitor<'a> {
     file: String,
     scope: Vec<String>,
+    scores: Scores,
+    /// Inside a `#[cfg(test)]` module: fns are walked (to keep the score
+    /// queues aligned) but not recorded.
+    in_test_mod: bool,
     functions: &'a mut Vec<FunctionMetrics>,
 }
 
 impl FnVisitor<'_> {
     fn record(
         &mut self,
-        name: &str,
+        ident: &syn::Ident,
         attrs: &[syn::Attribute],
         block: &syn::Block,
         span: proc_macro2::Span,
     ) {
-        if has_test_attr(attrs) {
+        let name = ident.to_string();
+        // Both parse the same source, so every fn we visit has an entry.
+        // Take it before the test check so same-key queues stay aligned.
+        let (cyclomatic, cognitive) = self
+            .scores
+            .get_mut(&(ident.span().start().line, name.clone()))
+            .and_then(VecDeque::pop_front)
+            .unwrap_or((1, 0));
+        if self.in_test_mod || has_test_attr(attrs) {
             return;
         }
         let qualified = if self.scope.is_empty() {
-            name.to_string()
+            name
         } else {
             format!("{}::{}", self.scope.join("::"), name)
         };
@@ -169,21 +219,21 @@ impl FnVisitor<'_> {
             name: qualified,
             start_line: span.start().line,
             end_line: span.end().line,
-            cyclomatic: crate::complexity::cyclomatic(block),
-            cognitive: crate::complexity::cognitive(block),
-            halstead_difficulty: crate::complexity::halstead_difficulty(block),
+            cyclomatic,
+            cognitive,
+            halstead_difficulty: crate::halstead::halstead_difficulty(block),
         });
     }
 }
 
 impl<'ast> Visit<'ast> for FnVisitor<'_> {
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if is_cfg_test(&node.attrs) {
-            return;
-        }
+        let outer = self.in_test_mod;
+        self.in_test_mod |= is_cfg_test(&node.attrs);
         self.scope.push(node.ident.to_string());
         syn::visit::visit_item_mod(self, node);
         self.scope.pop();
+        self.in_test_mod = outer;
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -193,27 +243,17 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        // No recursion: closures and nested fns score as part of this body.
-        self.record(
-            &node.sig.ident.to_string(),
-            &node.attrs,
-            &node.block,
-            node.span(),
-        );
+        // Not descended into: closures and nested fns score as part of this body.
+        self.record(&node.sig.ident, &node.attrs, &node.block, node.span());
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.record(
-            &node.sig.ident.to_string(),
-            &node.attrs,
-            &node.block,
-            node.span(),
-        );
+        self.record(&node.sig.ident, &node.attrs, &node.block, node.span());
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if let Some(block) = &node.default {
-            self.record(&node.sig.ident.to_string(), &node.attrs, block, node.span());
+            self.record(&node.sig.ident, &node.attrs, block, node.span());
         }
     }
 }
@@ -241,6 +281,8 @@ mod tests {
         let mut v = FnVisitor {
             file: "test.rs".into(),
             scope: Vec::new(),
+            in_test_mod: false,
+            scores: cccc_scores(Path::new("test.rs"), src),
             functions: &mut functions,
         };
         v.visit_file(&ast);
@@ -268,6 +310,49 @@ mod tests {
     fn qualifies_impl_methods() {
         let fns = metrics_for("struct S; impl S { fn go(&self) {} }");
         assert_eq!(fns[0].name, "S::go");
+    }
+
+    #[test]
+    fn closures_and_nested_fns_fold_into_their_named_fn() {
+        let fns = metrics_for(
+            r#"
+            fn outer(xs: &[u32]) -> usize {
+                fn helper(x: u32) -> bool { x > 1 && x < 9 }
+                xs.iter().filter(|x| if helper(**x) { true } else { false }).count()
+            }
+            "#,
+        );
+        assert_eq!(fns.len(), 1);
+        // helper: && (cyc +1, cog +1); closure: if/else (cyc +1, cog +2).
+        assert_eq!((fns[0].cyclomatic, fns[0].cognitive), (3, 3));
+    }
+
+    #[test]
+    fn same_name_fns_on_one_line_keep_their_own_scores() {
+        let fns = metrics_for(
+            "struct A; struct B; impl A { fn new() { if x {} } } impl B { fn new() { while y { if z {} } } }",
+        );
+        let scores: Vec<_> = fns.iter().map(|f| (f.name.as_str(), f.cognitive)).collect();
+        assert_eq!(scores, vec![("A::new", 1), ("B::new", 3)]);
+
+        // A skipped test-module fn on the same line must not hand its
+        // score to the production fn after it.
+        let fns = metrics_for("#[cfg(test)] mod t { fn f() { if x {} } } fn f() {}");
+        assert_eq!((fns[0].name.as_str(), fns[0].cognitive), ("f", 0));
+    }
+
+    #[test]
+    fn recursion_and_flat_else_if_follow_sonar() {
+        let fns = metrics_for(
+            r#"
+            fn fact(n: u64) -> u64 { if n == 0 { 1 } else { n * fact(n - 1) } }
+            fn f(a: bool, b: bool, c: bool) { if a { if b { } else if c { } } }
+            "#,
+        );
+        // if 1 + else 1 + recursive call 1
+        assert_eq!(fns[0].cognitive, 3);
+        // outer if 1 + nested if 2 + else-if 1 flat
+        assert_eq!(fns[1].cognitive, 4);
     }
 
     #[test]
