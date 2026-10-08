@@ -5,8 +5,8 @@
 //! * **Cyclomatic** — 1 + one per decision point: `if` / `if let`, `while` /
 //!   `while let`, `for`, `&&`, `||`, `?`, and `arms - 1` per `match`.
 //! * **Cognitive** — Sonar-style approximation: control-flow structures cost
-//!   `1 + nesting`, `else` branches cost 1, each run of a logical operator
-//!   (`a && b && c` is one run) costs 1, labeled `break`/`continue` cost 1,
+//!   `1 + nesting`, `else` / `else if` cost a flat 1, each run of a logical operator
+//!   (`a && b && c` or `(a && b) && c` is one run) costs 1, labeled `break`/`continue` cost 1,
 //!   and nesting increases inside branches, loops, and closures.
 //! * **Halstead difficulty** — `(n1 / 2) * (N2 / n2)` over the token stream
 //!   of the function body, where keywords/punctuation are operators and
@@ -66,8 +66,29 @@ impl CognitiveVisitor {
         self.nesting -= 1;
     }
 
+    /// Condition, then-branch, and the `else` / `else if` tail of an `if`
+    /// whose own increment the caller already charged. Every link in the
+    /// tail costs a flat 1 — `else if` gets no nesting bonus.
+    fn if_chain(&mut self, e: &syn::ExprIf) {
+        self.logical_runs(&e.cond, None);
+        self.nested(|v| v.visit_block(&e.then_branch));
+        if let Some((_, else_expr)) = &e.else_branch {
+            self.score += 1;
+            match else_expr.as_ref() {
+                syn::Expr::If(elif) => self.if_chain(elif),
+                other => self.nested(|v| v.visit_expr(other)),
+            }
+        }
+    }
+
     /// One increment per run of the same logical operator.
     fn logical_runs(&mut self, expr: &syn::Expr, parent: Option<&syn::BinOp>) {
+        // Parentheses don't break a run: `(a && b) && c` is still one run.
+        if let syn::Expr::Paren(p) = expr {
+            if parent.is_some() {
+                return self.logical_runs(&p.expr, parent);
+            }
+        }
         if let syn::Expr::Binary(b) = expr {
             if matches!(b.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
                 let same = matches!(
@@ -94,18 +115,7 @@ impl<'ast> Visit<'ast> for CognitiveVisitor {
         match node {
             syn::Expr::If(e) => {
                 self.score += 1 + self.nesting;
-                self.logical_runs(&e.cond, None);
-                self.nested(|v| v.visit_block(&e.then_branch));
-                if let Some((_, else_expr)) = &e.else_branch {
-                    match else_expr.as_ref() {
-                        // `else if` re-enters visit_expr and charges itself.
-                        syn::Expr::If(_) => self.visit_expr(else_expr),
-                        other => {
-                            self.score += 1;
-                            self.nested(|v| v.visit_expr(other));
-                        }
-                    }
-                }
+                self.if_chain(e);
             }
             syn::Expr::Match(m) => {
                 self.score += 1 + self.nesting;
@@ -307,6 +317,40 @@ mod tests {
         assert_eq!(cognitive(&block("if a { while b { } }")), 3);
         assert_eq!(cognitive(&block("if a { for x in y { } }")), 3);
         assert_eq!(cognitive(&block("if a { loop { } }")), 3);
+    }
+
+    #[test]
+    fn else_if_is_flat_even_when_nested() {
+        // outer if: 1, inner if: 2 (nested), else if: 1 flat, else: 1 => 5
+        assert_eq!(
+            cognitive(&block("if a { if b { } else if c { } else { } }")),
+            5
+        );
+    }
+
+    #[test]
+    fn parentheses_do_not_split_a_logical_run() {
+        assert_eq!(cognitive(&block("let x = (a && b) && c;")), 1);
+        // A different operator inside the parens is still its own run.
+        assert_eq!(cognitive(&block("let x = a && (b || c);")), 2);
+    }
+
+    #[test]
+    fn sonar_whitepaper_sum_of_primes_is_7() {
+        // Reference example from G. Ann Campbell's Cognitive Complexity
+        // whitepaper (also cccc's anchor test): for 1, nested for 2,
+        // nested if 3, labeled continue 1 => 7.
+        let b = block(
+            "let mut total = 0;
+             'out: for i in 1..=max {
+                 for j in 2..i {
+                     if i % j == 0 { continue 'out; }
+                 }
+                 total += i;
+             }
+             total",
+        );
+        assert_eq!(cognitive(&b), 7);
     }
 
     #[test]
