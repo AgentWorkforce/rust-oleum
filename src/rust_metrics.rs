@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+use crate::complexity::SelfRef;
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FunctionMetrics {
     /// Repo-relative file path.
@@ -151,7 +153,7 @@ struct FnVisitor<'a> {
 impl FnVisitor<'_> {
     fn record(
         &mut self,
-        name: &str,
+        me: SelfRef<'_>,
         attrs: &[syn::Attribute],
         block: &syn::Block,
         span: proc_macro2::Span,
@@ -160,9 +162,9 @@ impl FnVisitor<'_> {
             return;
         }
         let qualified = if self.scope.is_empty() {
-            name.to_string()
+            me.name().to_string()
         } else {
-            format!("{}::{}", self.scope.join("::"), name)
+            format!("{}::{}", self.scope.join("::"), me.name())
         };
         self.functions.push(FunctionMetrics {
             file: self.file.clone(),
@@ -170,7 +172,7 @@ impl FnVisitor<'_> {
             start_line: span.start().line,
             end_line: span.end().line,
             cyclomatic: crate::complexity::cyclomatic(block),
-            cognitive: crate::complexity::cognitive(block),
+            cognitive: crate::complexity::cognitive(block, me),
             halstead_difficulty: crate::complexity::halstead_difficulty(block),
         });
     }
@@ -193,9 +195,9 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        // No recursion: closures and nested fns score as part of this body.
+        // Not descended into: closures and nested fns score as part of this body.
         self.record(
-            &node.sig.ident.to_string(),
+            SelfRef::Free(&node.sig.ident.to_string()),
             &node.attrs,
             &node.block,
             node.span(),
@@ -204,7 +206,7 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         self.record(
-            &node.sig.ident.to_string(),
+            SelfRef::Assoc(&node.sig.ident.to_string()),
             &node.attrs,
             &node.block,
             node.span(),
@@ -213,7 +215,12 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if let Some(block) = &node.default {
-            self.record(&node.sig.ident.to_string(), &node.attrs, block, node.span());
+            self.record(
+                SelfRef::Assoc(&node.sig.ident.to_string()),
+                &node.attrs,
+                block,
+                node.span(),
+            );
         }
     }
 }
@@ -268,6 +275,21 @@ mod tests {
     fn qualifies_impl_methods() {
         let fns = metrics_for("struct S; impl S { fn go(&self) {} }");
         assert_eq!(fns[0].name, "S::go");
+    }
+
+    #[test]
+    fn recursion_is_scored_per_fn_kind() {
+        let fns = metrics_for(
+            r#"
+            fn walk(n: u32) { walk(n - 1) }
+            struct S;
+            impl S { fn walk(&self) { self.walk(); walk(1) } }
+            trait T { fn go(&self) { Self::go(self) } }
+            "#,
+        );
+        let cog: Vec<(&str, u32)> = fns.iter().map(|f| (f.name.as_str(), f.cognitive)).collect();
+        // The method's bare `walk(1)` calls the free fn, not itself.
+        assert_eq!(cog, vec![("walk", 1), ("S::walk", 1), ("go", 1)]);
     }
 
     #[test]

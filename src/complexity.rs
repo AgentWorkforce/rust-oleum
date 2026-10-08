@@ -7,7 +7,8 @@
 //! * **Cognitive** — Sonar-style approximation: control-flow structures cost
 //!   `1 + nesting`, `else` / `else if` cost a flat 1, each run of a logical operator
 //!   (`a && b && c` or `(a && b) && c` is one run) costs 1, labeled `break`/`continue` cost 1,
-//!   and nesting increases inside branches, loops, and closures.
+//!   a direct recursive call costs 1, and nesting increases inside branches,
+//!   loops, and closures.
 //! * **Halstead difficulty** — `(n1 / 2) * (N2 / n2)` over the token stream
 //!   of the function body, where keywords/punctuation are operators and
 //!   idents/literals are operands.
@@ -45,21 +46,64 @@ impl<'ast> Visit<'ast> for CyclomaticVisitor {
     }
 }
 
-pub fn cognitive(block: &syn::Block) -> u32 {
+/// How the function being scored calls itself, for recursion detection.
+#[derive(Clone, Copy)]
+pub enum SelfRef<'a> {
+    /// A free function, recursing as `name(..)`.
+    Free(&'a str),
+    /// A method or associated fn, recursing as `self.name(..)` or
+    /// `Self::name(..)`.
+    Assoc(&'a str),
+}
+
+impl<'a> SelfRef<'a> {
+    pub fn name(self) -> &'a str {
+        match self {
+            SelfRef::Free(name) | SelfRef::Assoc(name) => name,
+        }
+    }
+
+    /// True when `expr` is a direct call back into this function. Matching
+    /// is deliberately strict: `self.items.len()` inside `fn len(&self)` or a
+    /// same-named free fn called from a method is not recursion.
+    fn is_called_by(self, expr: &syn::Expr) -> bool {
+        match (self, expr) {
+            (SelfRef::Free(name), syn::Expr::Call(c)) => {
+                matches!(&*c.func, syn::Expr::Path(p) if p.qself.is_none() && p.path.is_ident(name))
+            }
+            (SelfRef::Assoc(name), syn::Expr::Call(c)) => match &*c.func {
+                syn::Expr::Path(p) if p.qself.is_none() => {
+                    let segs: Vec<_> = p.path.segments.iter().map(|s| &s.ident).collect();
+                    segs.len() == 2 && segs[0] == "Self" && segs[1] == name
+                }
+                _ => false,
+            },
+            (SelfRef::Assoc(name), syn::Expr::MethodCall(m)) => {
+                m.method == name
+                    && matches!(&*m.receiver, syn::Expr::Path(p) if p.path.is_ident("self"))
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn cognitive(block: &syn::Block, me: SelfRef<'_>) -> u32 {
     let mut v = CognitiveVisitor {
         score: 0,
         nesting: 0,
+        me,
     };
     v.visit_block(block);
     v.score
 }
 
-struct CognitiveVisitor {
+struct CognitiveVisitor<'a> {
     score: u32,
     nesting: u32,
+    me: SelfRef<'a>,
 }
 
-impl CognitiveVisitor {
+impl CognitiveVisitor<'_> {
     fn nested<F: FnOnce(&mut Self)>(&mut self, f: F) {
         self.nesting += 1;
         f(self);
@@ -115,8 +159,11 @@ impl CognitiveVisitor {
     }
 }
 
-impl<'ast> Visit<'ast> for CognitiveVisitor {
+impl<'ast> Visit<'ast> for CognitiveVisitor<'_> {
     fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        if self.me.is_called_by(node) {
+            self.score += 1;
+        }
         match node {
             syn::Expr::If(e) => {
                 self.score += 1 + self.nesting;
@@ -236,6 +283,30 @@ mod tests {
 
     fn block(src: &str) -> syn::Block {
         syn::parse_str(&format!("{{ {src} }}")).unwrap()
+    }
+
+    /// Cognitive score of a body whose name matches nothing it calls.
+    fn cognitive(b: &syn::Block) -> u32 {
+        super::cognitive(b, SelfRef::Free("__not_called__"))
+    }
+
+    #[test]
+    fn direct_recursion_costs_one_per_call() {
+        let b = block("if n == 0 { 1 } else { n * fact(n - 1) }");
+        // if: 1, else: 1, recursive call: 1 => 3
+        assert_eq!(super::cognitive(&b, SelfRef::Free("fact")), 3);
+        let b = block("self.walk(a); Self::walk(b); other.walk(c);");
+        assert_eq!(super::cognitive(&b, SelfRef::Assoc("walk")), 2);
+    }
+
+    #[test]
+    fn same_name_on_another_receiver_is_not_recursion() {
+        // `fn len(&self) { self.items.len() }` is delegation, not recursion.
+        let b = block("self.items.len() + len(x) + Other::len(y)");
+        assert_eq!(super::cognitive(&b, SelfRef::Assoc("len")), 0);
+        // A free fn doesn't recurse through `self.` or a qualified path.
+        let b = block("self.go(); m::go(); Self::go();");
+        assert_eq!(super::cognitive(&b, SelfRef::Free("go")), 0);
     }
 
     #[test]
