@@ -12,7 +12,7 @@
 //! shipping surface, and test tables/fixtures legitimately trade these
 //! metrics for readability.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -150,17 +150,22 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// `(cyclomatic, cognitive)` per function, keyed by `(ident line, name)` —
-/// the line of the fn's name, which is how cccc locates a function.
-type Scores = HashMap<(usize, String), (u32, u32)>;
+/// the line of the fn's name, which is how cccc locates a function. Same-key
+/// functions (e.g. two `fn new` on one unformatted line) queue in source
+/// order, the order both walks visit them.
+type Scores = HashMap<(usize, String), VecDeque<(u32, u32)>>;
 
 /// Score a file with cccc, folding closures and nested fns into the
 /// top-level function that contains them.
 fn cccc_scores(path: &Path, src: &str) -> Scores {
-    cccc_rs::analyze_source(path, src)
-        .functions
-        .iter()
-        .map(|f| ((f.line as usize, f.name.clone()), folded(f)))
-        .collect()
+    let mut scores = Scores::new();
+    for f in &cccc_rs::analyze_source(path, src).functions {
+        scores
+            .entry((f.line as usize, f.name.clone()))
+            .or_default()
+            .push_back(folded(f));
+    }
+    scores
 }
 
 /// A function's own scores plus every descendant's. Each child's McCabe
@@ -189,16 +194,17 @@ impl FnVisitor<'_> {
         block: &syn::Block,
         span: proc_macro2::Span,
     ) {
+        let name = ident.to_string();
+        // Both parse the same source, so every fn we visit has an entry.
+        // Take it before the test check so same-key queues stay aligned.
+        let (cyclomatic, cognitive) = self
+            .scores
+            .get_mut(&(ident.span().start().line, name.clone()))
+            .and_then(VecDeque::pop_front)
+            .unwrap_or((1, 0));
         if has_test_attr(attrs) {
             return;
         }
-        let name = ident.to_string();
-        // Both parse the same source, so every fn we visit has an entry.
-        let (cyclomatic, cognitive) = self
-            .scores
-            .get(&(ident.span().start().line, name.clone()))
-            .copied()
-            .unwrap_or((1, 0));
         let qualified = if self.scope.is_empty() {
             name
         } else {
@@ -314,6 +320,15 @@ mod tests {
         assert_eq!(fns.len(), 1);
         // helper: && (cyc +1, cog +1); closure: if/else (cyc +1, cog +2).
         assert_eq!((fns[0].cyclomatic, fns[0].cognitive), (3, 3));
+    }
+
+    #[test]
+    fn same_name_fns_on_one_line_keep_their_own_scores() {
+        let fns = metrics_for(
+            "struct A; struct B; impl A { fn new() { if x {} } } impl B { fn new() { while y { if z {} } } }",
+        );
+        let scores: Vec<_> = fns.iter().map(|f| (f.name.as_str(), f.cognitive)).collect();
+        assert_eq!(scores, vec![("A::new", 1), ("B::new", 3)]);
     }
 
     #[test]
