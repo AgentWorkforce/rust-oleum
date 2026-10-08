@@ -84,6 +84,7 @@ pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics>
         let mut visitor = FnVisitor {
             file: rel,
             scope: Vec::new(),
+            in_test_mod: false,
             scores: cccc_scores(&path, &src),
             functions: &mut out.functions,
         };
@@ -183,6 +184,9 @@ struct FnVisitor<'a> {
     file: String,
     scope: Vec<String>,
     scores: Scores,
+    /// Inside a `#[cfg(test)]` module: fns are walked (to keep the score
+    /// queues aligned) but not recorded.
+    in_test_mod: bool,
     functions: &'a mut Vec<FunctionMetrics>,
 }
 
@@ -202,7 +206,7 @@ impl FnVisitor<'_> {
             .get_mut(&(ident.span().start().line, name.clone()))
             .and_then(VecDeque::pop_front)
             .unwrap_or((1, 0));
-        if has_test_attr(attrs) {
+        if self.in_test_mod || has_test_attr(attrs) {
             return;
         }
         let qualified = if self.scope.is_empty() {
@@ -224,12 +228,12 @@ impl FnVisitor<'_> {
 
 impl<'ast> Visit<'ast> for FnVisitor<'_> {
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if is_cfg_test(&node.attrs) {
-            return;
-        }
+        let outer = self.in_test_mod;
+        self.in_test_mod |= is_cfg_test(&node.attrs);
         self.scope.push(node.ident.to_string());
         syn::visit::visit_item_mod(self, node);
         self.scope.pop();
+        self.in_test_mod = outer;
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -277,6 +281,7 @@ mod tests {
         let mut v = FnVisitor {
             file: "test.rs".into(),
             scope: Vec::new(),
+            in_test_mod: false,
             scores: cccc_scores(Path::new("test.rs"), src),
             functions: &mut functions,
         };
@@ -329,6 +334,11 @@ mod tests {
         );
         let scores: Vec<_> = fns.iter().map(|f| (f.name.as_str(), f.cognitive)).collect();
         assert_eq!(scores, vec![("A::new", 1), ("B::new", 3)]);
+
+        // A skipped test-module fn on the same line must not hand its
+        // score to the production fn after it.
+        let fns = metrics_for("#[cfg(test)] mod t { fn f() { if x {} } } fn f() {}");
+        assert_eq!((fns[0].name.as_str(), fns[0].cognitive), ("f", 0));
     }
 
     #[test]
