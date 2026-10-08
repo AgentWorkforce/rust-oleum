@@ -104,9 +104,14 @@ impl CognitiveVisitor {
                 return;
             }
         }
-        // Non-logical subtree: fall back to the general walk, which will
-        // restart run detection inside it.
-        syn::visit::visit_expr(self, expr);
+        // Non-logical subtree: restart run detection inside it. Any other
+        // binary op takes the default walk (`visit_expr` would route it
+        // straight back here); everything else goes through `visit_expr`
+        // so an `if`/`match`/loop operand still charges its increment.
+        match expr {
+            syn::Expr::Binary(_) => syn::visit::visit_expr(self, expr),
+            _ => self.visit_expr(expr),
+        }
     }
 }
 
@@ -333,6 +338,19 @@ mod tests {
         assert_eq!(cognitive(&block("let x = (a && b) && c;")), 1);
         // A different operator inside the parens is still its own run.
         assert_eq!(cognitive(&block("let x = a && (b || c);")), 2);
+    }
+
+    #[test]
+    fn control_flow_inside_a_logical_operand_still_counts() {
+        // && run: 1, if: 1, else: 1 => 3 (parenthesized or not).
+        assert_eq!(
+            cognitive(&block("let x = a && (if b { c } else { d });")),
+            3
+        );
+        // && run: 1, match: 1 => 2
+        assert_eq!(cognitive(&block("let x = a && match y { _ => true };")), 2);
+        // Non-logical binary operands still walk normally.
+        assert_eq!(cognitive(&block("let x = a && b + c;")), 1);
     }
 
     #[test]
