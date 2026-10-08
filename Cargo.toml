@@ -2,7 +2,7 @@
 name = "rust-oleum"
 version = "0.1.2"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/AgentWorkforce/rust-oleum"
 description = "A protective coating for your codebase: a code-quality ratchet gate for Rust — complexity, coverage, CRAP, mutants, dead code — enforced in CI with a shrinking baseline."
@@ -18,10 +18,14 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Source-level metrics (cyclomatic / cognitive / Halstead) come from a
-# syn AST walk; span-locations turns on line/column info in proc-macro2
-# fallback spans so per-function line ranges can be joined with lcov data.
-syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+# Cyclomatic / cognitive complexity are scored by cccc (moznion/cccc).
+# Pinned exactly: a scoring change shifts every user's ratchet, so upgrades
+# should be deliberate. Halstead and per-function line ranges come from our
+# own syn walk; span-locations turns on line/column info in proc-macro2
+# fallback spans so those ranges can be joined with lcov data.
+syn = { version = "3", features = ["full", "visit", "extra-traits"] }
+cccc-rs = "=1.7.1"
+cccc-core = "=1.7.1"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 toml = "0.8"

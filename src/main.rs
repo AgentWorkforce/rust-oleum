@@ -6,10 +6,10 @@
 //! Existing violations are grandfathered in a `[baseline]` section that may
 //! only shrink: new violations and regressions fail, today's debt doesn't.
 
-mod complexity;
 mod config;
 mod coverage;
 mod external;
+mod halstead;
 mod init;
 mod loc;
 mod report;

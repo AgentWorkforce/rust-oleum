@@ -30,8 +30,8 @@ ratchet tightens — it never loosens.
 
 | Metric | Default target | Measured from |
 |---|---|---|
-| Cyclomatic complexity | ≤ 22 per function | source |
-| Cognitive complexity | ≤ 22 per function | source |
+| Cyclomatic complexity | ≤ 22 per function | source ([cccc]) |
+| Cognitive complexity | ≤ 22 per function | source ([cccc]) |
 | Halstead difficulty | ≤ 80 per function | source |
 | Lines of code | ≤ 500 per file | source |
 | Test coverage | 100% | `--coverage` lcov file |
@@ -41,7 +41,9 @@ ratchet tightens — it never loosens.
 | Surviving mutants | 0 | `--mutants` outcomes file |
 
 Source metrics work with zero setup and skip test code (`tests/`,
-`*_tests.rs`, `#[cfg(test)]`). The rest gate only when you pass the input:
+`*_tests.rs`, `#[cfg(test)]`). Cyclomatic (McCabe) and cognitive
+(SonarSource) complexity are scored by [cccc]; closures and nested `fn`s
+count toward the named function that contains them. The rest gate only when you pass the input:
 
 ```sh
 cargo llvm-cov --workspace --lcov --output-path lcov.info
@@ -80,6 +82,8 @@ its grandfathered ceiling. `rust-oleum --write-baseline` regenerates the
 section after a refactor. The coverage floor works the same way: measured
 coverage may never drop below the baseline floor while you climb toward the
 target.
+
+[cccc]: https://github.com/moznion/cccc
 
 ## License
 

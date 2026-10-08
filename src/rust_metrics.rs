@@ -1,19 +1,23 @@
 //! Source-level metrics for Rust production code: per-function cyclomatic
-//! complexity, cognitive complexity (Sonar-style approximation), Halstead
-//! difficulty, and per-file logical lines of code.
+//! complexity (McCabe) and cognitive complexity (SonarSource), both scored by
+//! [`cccc-rs`](https://github.com/moznion/cccc); Halstead difficulty; and
+//! per-file logical lines of code.
+//!
+//! cccc reports closures and nested `fn`s as children of their enclosing
+//! function. We fold them back into the named function that contains them,
+//! so each named fn stays one gated entry with a stable baseline key.
 //!
 //! Test code (`tests/` dirs, `*_tests.rs` / `tests.rs` files, `#[cfg(test)]`
 //! modules, `#[test]` functions) is excluded: the benchmark measures the
 //! shipping surface, and test tables/fixtures legitimately trade these
 //! metrics for readability.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-
-use crate::complexity::SelfRef;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FunctionMetrics {
@@ -80,6 +84,7 @@ pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics>
         let mut visitor = FnVisitor {
             file: rel,
             scope: Vec::new(),
+            scores: cccc_scores(&path, &src),
             functions: &mut out.functions,
         };
         visitor.visit_file(&ast);
@@ -144,16 +149,42 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
         || is_cfg_test(attrs)
 }
 
+/// `(cyclomatic, cognitive)` per function, keyed by `(ident line, name)` —
+/// the line of the fn's name, which is how cccc locates a function.
+type Scores = HashMap<(usize, String), (u32, u32)>;
+
+/// Score a file with cccc, folding closures and nested fns into the
+/// top-level function that contains them.
+fn cccc_scores(path: &Path, src: &str) -> Scores {
+    cccc_rs::analyze_source(path, src)
+        .functions
+        .iter()
+        .map(|f| ((f.line as usize, f.name.clone()), folded(f)))
+        .collect()
+}
+
+/// A function's own scores plus every descendant's. Each child's McCabe
+/// base of 1 is dropped: a closure adds its decision points, not a path.
+fn folded(f: &cccc_core::report::FunctionReport) -> (u32, u32) {
+    f.children
+        .iter()
+        .map(folded)
+        .fold((f.cyclomatic, f.cognitive), |(cyc, cog), (c_cyc, c_cog)| {
+            (cyc + c_cyc - 1, cog + c_cog)
+        })
+}
+
 struct FnVisitor<'a> {
     file: String,
     scope: Vec<String>,
+    scores: Scores,
     functions: &'a mut Vec<FunctionMetrics>,
 }
 
 impl FnVisitor<'_> {
     fn record(
         &mut self,
-        me: SelfRef<'_>,
+        ident: &syn::Ident,
         attrs: &[syn::Attribute],
         block: &syn::Block,
         span: proc_macro2::Span,
@@ -161,19 +192,26 @@ impl FnVisitor<'_> {
         if has_test_attr(attrs) {
             return;
         }
+        let name = ident.to_string();
+        // Both parse the same source, so every fn we visit has an entry.
+        let (cyclomatic, cognitive) = self
+            .scores
+            .get(&(ident.span().start().line, name.clone()))
+            .copied()
+            .unwrap_or((1, 0));
         let qualified = if self.scope.is_empty() {
-            me.name().to_string()
+            name
         } else {
-            format!("{}::{}", self.scope.join("::"), me.name())
+            format!("{}::{}", self.scope.join("::"), name)
         };
         self.functions.push(FunctionMetrics {
             file: self.file.clone(),
             name: qualified,
             start_line: span.start().line,
             end_line: span.end().line,
-            cyclomatic: crate::complexity::cyclomatic(block),
-            cognitive: crate::complexity::cognitive(block, me),
-            halstead_difficulty: crate::complexity::halstead_difficulty(block),
+            cyclomatic,
+            cognitive,
+            halstead_difficulty: crate::halstead::halstead_difficulty(block),
         });
     }
 }
@@ -196,31 +234,16 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         // Not descended into: closures and nested fns score as part of this body.
-        self.record(
-            SelfRef::Free(&node.sig.ident.to_string()),
-            &node.attrs,
-            &node.block,
-            node.span(),
-        );
+        self.record(&node.sig.ident, &node.attrs, &node.block, node.span());
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.record(
-            SelfRef::Assoc(&node.sig.ident.to_string()),
-            &node.attrs,
-            &node.block,
-            node.span(),
-        );
+        self.record(&node.sig.ident, &node.attrs, &node.block, node.span());
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if let Some(block) = &node.default {
-            self.record(
-                SelfRef::Assoc(&node.sig.ident.to_string()),
-                &node.attrs,
-                block,
-                node.span(),
-            );
+            self.record(&node.sig.ident, &node.attrs, block, node.span());
         }
     }
 }
@@ -248,6 +271,7 @@ mod tests {
         let mut v = FnVisitor {
             file: "test.rs".into(),
             scope: Vec::new(),
+            scores: cccc_scores(Path::new("test.rs"), src),
             functions: &mut functions,
         };
         v.visit_file(&ast);
@@ -278,18 +302,32 @@ mod tests {
     }
 
     #[test]
-    fn recursion_is_scored_per_fn_kind() {
+    fn closures_and_nested_fns_fold_into_their_named_fn() {
         let fns = metrics_for(
             r#"
-            fn walk(n: u32) { walk(n - 1) }
-            struct S;
-            impl S { fn walk(&self) { self.walk(); walk(1) } }
-            trait T { fn go(&self) { Self::go(self) } }
+            fn outer(xs: &[u32]) -> usize {
+                fn helper(x: u32) -> bool { x > 1 && x < 9 }
+                xs.iter().filter(|x| if helper(**x) { true } else { false }).count()
+            }
             "#,
         );
-        let cog: Vec<(&str, u32)> = fns.iter().map(|f| (f.name.as_str(), f.cognitive)).collect();
-        // The method's bare `walk(1)` calls the free fn, not itself.
-        assert_eq!(cog, vec![("walk", 1), ("S::walk", 1), ("go", 1)]);
+        assert_eq!(fns.len(), 1);
+        // helper: && (cyc +1, cog +1); closure: if/else (cyc +1, cog +2).
+        assert_eq!((fns[0].cyclomatic, fns[0].cognitive), (3, 3));
+    }
+
+    #[test]
+    fn recursion_and_flat_else_if_follow_sonar() {
+        let fns = metrics_for(
+            r#"
+            fn fact(n: u64) -> u64 { if n == 0 { 1 } else { n * fact(n - 1) } }
+            fn f(a: bool, b: bool, c: bool) { if a { if b { } else if c { } } }
+            "#,
+        );
+        // if 1 + else 1 + recursive call 1
+        assert_eq!(fns[0].cognitive, 3);
+        // outer if 1 + nested if 2 + else-if 1 flat
+        assert_eq!(fns[1].cognitive, 4);
     }
 
     #[test]
