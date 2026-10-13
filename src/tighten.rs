@@ -46,6 +46,7 @@ impl std::fmt::Display for Summary {
 pub struct Measured {
     pub coverage: bool,
     pub crap: bool,
+    pub lints: bool,
 }
 
 /// Rewrite `path` with `old` clamped to the freshly measured baseline.
@@ -83,6 +84,16 @@ pub fn clamp(old: &Baseline, fresh: &Baseline, measured: Measured) -> (Baseline,
         panic: clamp_map(&old.panic, &fresh.panic, &mut s),
         allow: clamp_map(&old.allow, &fresh.allow, &mut s),
         file_allow: clamp_map(&old.file_allow, &fresh.file_allow, &mut s),
+        dead_code: if measured.lints {
+            clamp_map(&old.dead_code, &fresh.dead_code, &mut s)
+        } else {
+            old.dead_code.clone()
+        },
+        redundant_code: if measured.lints {
+            clamp_map(&old.redundant_code, &fresh.redundant_code, &mut s)
+        } else {
+            old.redundant_code.clone()
+        },
     };
     (tight, s)
 }
@@ -177,6 +188,7 @@ mod tests {
     const ALL: Measured = Measured {
         coverage: true,
         crap: true,
+        lints: true,
     };
 
     fn baseline(entries: &[(&str, u32)]) -> Baseline {
@@ -218,6 +230,7 @@ mod tests {
         let none = Measured {
             coverage: false,
             crap: false,
+            lints: false,
         };
         let (tight, s) = clamp(&old, &Baseline::default(), none);
         assert_eq!(tight.coverage_min_pct, Some(70.0));
