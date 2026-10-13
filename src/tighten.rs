@@ -79,6 +79,10 @@ pub fn clamp(old: &Baseline, fresh: &Baseline, measured: Measured) -> (Baseline,
         cognitive: clamp_map(&old.cognitive, &fresh.cognitive, &mut s),
         halstead: clamp_map(&old.halstead, &fresh.halstead, &mut s),
         crap,
+        unsafe_: clamp_map(&old.unsafe_, &fresh.unsafe_, &mut s),
+        panic: clamp_map(&old.panic, &fresh.panic, &mut s),
+        allow: clamp_map(&old.allow, &fresh.allow, &mut s),
+        file_allow: clamp_map(&old.file_allow, &fresh.file_allow, &mut s),
     };
     (tight, s)
 }

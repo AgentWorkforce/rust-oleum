@@ -32,6 +32,10 @@ crap_max = 25.0
 surviving_mutants_max = 0
 dead_code_max = 0
 redundant_code_max = 0
+unsafe_max = 0
+panic_max = 0
+allow_max = 0
+file_allow_max = 0
 ";
 
 pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Result<()> {
@@ -175,8 +179,13 @@ pub fn baseline(
             .map(coverage_floor),
         ..Default::default()
     };
-    for f in rust.files.iter().filter(|f| f.loc > t.file_loc_max) {
-        insert_max(&mut b.file_loc, f.file.clone(), f.loc);
+    for f in &rust.files {
+        if f.loc > t.file_loc_max {
+            insert_max(&mut b.file_loc, f.file.clone(), f.loc);
+        }
+        if f.allow_count > t.file_allow_max {
+            insert_max(&mut b.file_allow, f.file.clone(), f.allow_count);
+        }
     }
     for f in &rust.functions {
         let key = || config::function_key(&f.file, &f.name);
@@ -188,6 +197,15 @@ pub fn baseline(
         }
         if f.halstead_difficulty > t.halstead_difficulty_max {
             insert_max(&mut b.halstead, key(), float_ceiling(f.halstead_difficulty));
+        }
+        if f.unsafe_count > t.unsafe_max {
+            insert_max(&mut b.unsafe_, key(), f.unsafe_count);
+        }
+        if f.panic_count > t.panic_max {
+            insert_max(&mut b.panic, key(), f.panic_count);
+        }
+        if f.allow_count > t.allow_max {
+            insert_max(&mut b.allow, key(), f.allow_count);
         }
     }
     for s in crap
@@ -232,6 +250,10 @@ pub fn render_baseline(b: &config::Baseline) -> String {
     section(&mut out, "cognitive", &b.cognitive, |v| v.to_string());
     section(&mut out, "halstead", &b.halstead, |v| format!("{v:?}"));
     section(&mut out, "crap", &b.crap, |v| format!("{v:?}"));
+    section(&mut out, "unsafe", &b.unsafe_, |v| v.to_string());
+    section(&mut out, "panic", &b.panic, |v| v.to_string());
+    section(&mut out, "allow", &b.allow, |v| v.to_string());
+    section(&mut out, "file_allow", &b.file_allow, |v| v.to_string());
     out
 }
 
@@ -280,6 +302,12 @@ mod tests {
         // A file over the LOC target must land in the baseline.
         let big: String = (0..501).map(|i| format!("fn f{i}() {{}}\n")).collect();
         std::fs::write(dir.path().join("crates/a/src/big.rs"), big).unwrap();
+        // Safety offenders must be grandfathered too.
+        std::fs::write(
+            dir.path().join("crates/a/src/risky.rs"),
+            "#![allow(unused)]\n#[allow(dead_code)]\nunsafe fn r() { unsafe { x() }; y.unwrap(); }\n",
+        )
+        .unwrap();
 
         run(dir.path(), None, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
@@ -289,6 +317,12 @@ mod tests {
             config.baseline.file_loc.get("crates/a/src/big.rs"),
             Some(&501)
         );
+        let b = &config.baseline;
+        assert_eq!(b.unsafe_.get("crates/a/src/risky.rs::r"), Some(&2));
+        assert_eq!(b.panic.get("crates/a/src/risky.rs::r"), Some(&1));
+        assert_eq!(b.allow.get("crates/a/src/risky.rs::r"), Some(&1));
+        assert_eq!(b.file_allow.get("crates/a/src/risky.rs"), Some(&1));
+        assert!(!b.unsafe_.contains_key("crates/a/src/lib.rs::tidy"));
 
         // Refuses to clobber without --force, allows it with.
         assert!(run(dir.path(), None, false).is_err());
@@ -304,6 +338,9 @@ mod tests {
             cyclomatic: cx,
             cognitive: cx,
             halstead_difficulty: halstead,
+            unsafe_count: 0,
+            panic_count: 0,
+            allow_count: 0,
         }
     }
 
@@ -338,6 +375,7 @@ mod tests {
             files: vec![rust_metrics::FileMetrics {
                 file: "src/a.rs".into(),
                 loc: 812,
+                allow_count: 0,
             }],
             functions,
         };

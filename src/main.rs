@@ -1,8 +1,9 @@
 //! `rust-oleum` — a code-quality ratchet gate.
 //!
 //! Measures a codebase against the targets in `rust-oleum.toml` (complexity,
-//! Halstead difficulty, file size, coverage, CRAP, mutants, dead/redundant
-//! code) and exits non-zero when the enforced gate fails.
+//! Halstead difficulty, file size, unsafe/panic/lint-suppression counts,
+//! coverage, CRAP, mutants, dead/redundant code) and exits non-zero when
+//! the enforced gate fails.
 //! Existing violations are grandfathered in a `[baseline]` section that may
 //! only shrink: new violations and regressions fail, today's debt doesn't.
 
@@ -14,6 +15,7 @@ mod init;
 mod loc;
 mod report;
 mod rust_metrics;
+mod rust_safety;
 mod tighten;
 
 use std::path::PathBuf;

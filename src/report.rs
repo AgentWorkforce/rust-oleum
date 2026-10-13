@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use crate::config::{function_key, Config};
 use crate::coverage::CrapScore;
 use crate::external::{LintCounts, MutantCounts};
-use crate::rust_metrics::RustMetrics;
+use crate::rust_metrics::{FunctionMetrics, RustMetrics};
 
 #[derive(Debug, serde::Serialize)]
 pub struct MetricRow {
@@ -155,6 +155,7 @@ pub fn build(
 ) -> Report {
     let mut report = Report::default();
     source_rows(config, rust, &mut report);
+    safety_rows(config, rust, &mut report);
     coverage_row(config, coverage_pct, &mut report);
     crap_row(config, crap, &mut report);
     mutants_row(config, mutants, &mut report);
@@ -236,6 +237,49 @@ fn source_rows(config: &Config, rust: &RustMetrics, report: &mut Report) {
         rust.files.iter().map(|f| (f.file.clone(), f.loc)),
         t.file_loc_max,
         &b.file_loc,
+    );
+}
+
+/// Rust safety rows: `unsafe`, panic calls, and lint suppressions.
+fn safety_rows(config: &Config, rust: &RustMetrics, report: &mut Report) {
+    let t = &config.targets;
+    let b = &config.baseline;
+    let per_fn = |field: fn(&FunctionMetrics) -> u32| {
+        rust.functions
+            .iter()
+            .map(move |f| (function_key(&f.file, &f.name), field(f)))
+    };
+    item_metric_row(
+        report,
+        ("unsafe", "function"),
+        "Unsafe blocks (per fn)",
+        per_fn(|f| f.unsafe_count),
+        t.unsafe_max,
+        &b.unsafe_,
+    );
+    item_metric_row(
+        report,
+        ("panic", "function"),
+        "Panic calls (per fn)",
+        per_fn(|f| f.panic_count),
+        t.panic_max,
+        &b.panic,
+    );
+    item_metric_row(
+        report,
+        ("allow", "function"),
+        "Lint suppressions (per fn)",
+        per_fn(|f| f.allow_count),
+        t.allow_max,
+        &b.allow,
+    );
+    item_metric_row(
+        report,
+        ("file_allow", "file"),
+        "Lint suppressions (per file)",
+        rust.files.iter().map(|f| (f.file.clone(), f.allow_count)),
+        t.file_allow_max,
+        &b.file_allow,
     );
 }
 
@@ -523,6 +567,7 @@ mod tests {
                 surviving_mutants_max: 0,
                 dead_code_max: 0,
                 redundant_code_max: 0,
+                ..Targets::default()
             },
             baseline: Baseline {
                 coverage_min_pct: Some(80.0),
@@ -531,6 +576,7 @@ mod tests {
                 cognitive: BTreeMap::new(),
                 halstead: BTreeMap::new(),
                 crap: BTreeMap::new(),
+                ..Baseline::default()
             },
             sources: Sources { rust_roots: vec![] },
         }
@@ -545,6 +591,9 @@ mod tests {
             cyclomatic,
             cognitive: 1,
             halstead_difficulty: 1.0,
+            unsafe_count: 0,
+            panic_count: 0,
+            allow_count: 0,
         }
     }
 
@@ -556,10 +605,12 @@ mod tests {
                 FileMetrics {
                     file: "ok.rs".into(),
                     loc: 100,
+                    allow_count: 0,
                 },
                 FileMetrics {
                     file: "big.rs".into(),
                     loc: 150,
+                    allow_count: 0,
                 },
             ],
             // Exactly at target: passes; one above: new violation.
@@ -594,7 +645,7 @@ mod tests {
             Some(&mutants),
         );
 
-        assert_eq!(report.rows.len(), 9);
+        assert_eq!(report.rows.len(), 13);
         let row = |m: &str| report.rows.iter().find(|r| r.metric.contains(m)).unwrap();
 
         // cyclomatic: "over" (11) is a new violation; "at_limit" (10) is not.
@@ -643,6 +694,7 @@ mod tests {
             files: vec![FileMetrics {
                 file: "ok.rs".into(),
                 loc: 10,
+                allow_count: 0,
             }],
             functions: vec![fn_metric("small", 1)],
         };
@@ -738,6 +790,40 @@ mod tests {
             Some(&clean_mutants),
         );
         assert!(report.gate_passed());
+    }
+
+    #[test]
+    fn safety_rows_gate_and_honor_baselines() {
+        let mut config = test_config();
+        config.baseline.file_loc.clear();
+        config.baseline.panic.insert("a.rs::legacy".into(), 2);
+        config.baseline.file_allow.insert("old.rs".into(), 1);
+        let mut legacy = fn_metric("legacy", 1);
+        legacy.panic_count = 2;
+        let mut risky = fn_metric("risky", 1);
+        risky.unsafe_count = 1;
+        risky.allow_count = 1;
+        let rust = RustMetrics {
+            files: vec![FileMetrics {
+                file: "old.rs".into(),
+                loc: 10,
+                allow_count: 1,
+            }],
+            functions: vec![legacy, risky],
+        };
+        let report = build(&config, &rust, None, None, None, None);
+        let row = |m: &str| report.rows.iter().find(|r| r.metric == m).unwrap();
+        assert!(!row("Panic calls (per fn)").meets_target);
+        assert!(row("Panic calls (per fn)").passes_gate);
+        assert!(row("Lint suppressions (per file)").passes_gate);
+        assert!(!row("Unsafe blocks (per fn)").passes_gate);
+        assert!(!row("Lint suppressions (per fn)").passes_gate);
+        assert!(report
+            .violations
+            .iter()
+            .any(|v| v == "unsafe: a.rs::risky = 1 exceeds target 0 (new violation)"));
+        assert!(report.violations.iter().any(|v| v.starts_with("allow:")));
+        assert_eq!(report.violations.len(), 2, "{:?}", report.violations);
     }
 
     #[test]

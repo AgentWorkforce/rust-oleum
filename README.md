@@ -34,6 +34,10 @@ grandfathered offender and the gate makes you lock the gain in (run
 | Cognitive complexity | ≤ 22 per function | source |
 | Halstead difficulty | ≤ 80 per function | source |
 | Lines of code | ≤ 500 per file | source |
+| `unsafe` blocks (`unsafe fn` counts 1) | 0 per function | source |
+| Panic calls (`.unwrap()`, `.expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `assert!`/`assert_eq!`/`assert_ne!`) | 0 per function | source |
+| Lint suppressions (`#[allow]` / `#[expect]`, each lint counted) | 0 per function | source |
+| Lint suppressions outside functions (`#![allow]`, on mods/impls/types) | 0 per file | source |
 | Test coverage | 100% | `--coverage` lcov file |
 | CRAP score | ≤ 25 per function | `--coverage` lcov file |
 | Dead code | 0 findings | `--clippy-log` JSON |
