@@ -100,23 +100,33 @@ fn item_metric_row<V: PartialOrd + Copy + std::fmt::Display>(
     target: V,
     baseline: &BTreeMap<String, V>,
 ) {
-    let (worst, over) = check_items(items, target, baseline, key, &mut report.violations);
+    let row = item_row(&mut report.violations, key, label, items, target, baseline);
+    report.push_row(key, row);
+}
+
+/// Build a per-item row, recording any violations under the `key` prefix.
+fn item_row<V: PartialOrd + Copy + std::fmt::Display>(
+    violations: &mut Vec<String>,
+    key: &str,
+    label: &str,
+    items: impl Iterator<Item = (String, V)>,
+    target: V,
+    baseline: &BTreeMap<String, V>,
+) -> MetricRow {
+    let (worst, over) = check_items(items, target, baseline, key, violations);
     let worst_s = worst.map(|(k, v)| (k, v.to_string()));
     let detail = match &worst_s {
         Some((k, v)) => format!("{over} over target; worst: {k} = {v}"),
         None => String::new(),
     };
-    report.push_row(
-        key,
-        MetricRow {
-            metric: label.into(),
-            value: worst_s.map(|(_, v)| v).unwrap_or_default(),
-            target: format!("<= {target}"),
-            meets_target: over == 0,
-            passes_gate: true,
-            detail,
-        },
-    );
+    MetricRow {
+        metric: label.into(),
+        value: worst_s.map(|(_, v)| v).unwrap_or_default(),
+        target: format!("<= {target}"),
+        meets_target: over == 0,
+        passes_gate: true,
+        detail,
+    }
 }
 
 fn source_rows(config: &Config, rust: &RustMetrics, report: &mut Report) {
@@ -263,48 +273,64 @@ fn mutants_row(config: &Config, mutants: Option<&MutantCounts>, report: &mut Rep
 
 fn lint_rows(config: &Config, lints: Option<&LintCounts>, report: &mut Report) {
     let t = &config.targets;
+    let b = &config.baseline;
     let Some(l) = lints else {
-        for name in ["Dead code findings", "Redundant code findings"] {
-            report
-                .rows
-                .push(not_measured(name, "<= 0", "needs --clippy-log"));
+        for (name, max) in [
+            ("Dead code findings", t.dead_code_max),
+            ("Redundant code findings", t.redundant_code_max),
+        ] {
+            report.rows.push(not_measured(
+                name,
+                &format!("<= {max}/item"),
+                "needs --clippy-log",
+            ));
         }
         return;
     };
-    if l.dead_code > t.dead_code_max {
-        report.violations.push(format!(
-            "dead code: {} findings (max {})",
-            l.dead_code, t.dead_code_max
-        ));
-    }
-    report.push_row(
+    lint_row(
+        report,
         "dead code",
-        MetricRow {
-            metric: "Dead code findings".into(),
-            value: l.dead_code.to_string(),
-            target: format!("<= {}", t.dead_code_max),
-            meets_target: l.dead_code <= t.dead_code_max,
-            passes_gate: true,
-            detail: "rustc dead/unused/unreachable lints".into(),
-        },
+        "Dead code findings",
+        (&l.dead_code_items, l.dead_code),
+        t.dead_code_max,
+        &b.dead_code,
     );
-    if l.redundant > t.redundant_code_max {
-        report.violations.push(format!(
-            "redundant code: {} findings (max {})",
-            l.redundant, t.redundant_code_max
-        ));
-    }
-    report.push_row(
+    lint_row(
+        report,
         "redundant code",
-        MetricRow {
-            metric: "Redundant code findings".into(),
-            value: l.redundant.to_string(),
-            target: format!("<= {}", t.redundant_code_max),
-            meets_target: l.redundant <= t.redundant_code_max,
-            passes_gate: true,
-            detail: "clippy redundant/needless/duplicate lints".into(),
-        },
+        "Redundant code findings",
+        (&l.redundant_items, l.redundant),
+        t.redundant_code_max,
+        &b.redundant_code,
     );
+}
+
+/// Per-item lint row: items (`lint@file::fn` -> count) are gated like
+/// complexity, while the row shows the total finding count.
+fn lint_row(
+    report: &mut Report,
+    key: &str,
+    label: &str,
+    (items, total): (&BTreeMap<String, usize>, usize),
+    max: usize,
+    baseline: &BTreeMap<String, usize>,
+) {
+    let mut row = item_row(
+        &mut report.violations,
+        key,
+        label,
+        items.iter().map(|(k, n)| (k.clone(), *n)),
+        max,
+        baseline,
+    );
+    row.value = total.to_string();
+    row.target = format!("<= {max}/item");
+    row.detail = if items.is_empty() {
+        "no findings".into()
+    } else {
+        format!("{} items; {}", items.len(), row.detail)
+    };
+    report.push_row(key, row);
 }
 
 fn not_measured(metric: &str, target: &str, detail: &str) -> MetricRow {
@@ -433,6 +459,8 @@ mod tests {
                 cognitive: BTreeMap::new(),
                 halstead: BTreeMap::new(),
                 crap: BTreeMap::new(),
+                dead_code: BTreeMap::new(),
+                redundant_code: BTreeMap::new(),
             },
             sources: Sources { rust_roots: vec![] },
         }
@@ -475,9 +503,12 @@ mod tests {
             crap: 132.0,
         }];
         let lints = LintCounts {
-            dead_code: 0,
             redundant: 1,
-            examples: vec![],
+            redundant_items: BTreeMap::from([(
+                "clippy::needless_return@a.rs::over".to_string(),
+                1,
+            )]),
+            ..LintCounts::default()
         };
         let mutants = MutantCounts {
             total: 3,
@@ -604,8 +635,8 @@ mod tests {
         let rust = RustMetrics::default();
         let lints = LintCounts {
             dead_code: 1,
-            redundant: 0,
-            examples: vec![],
+            dead_code_items: BTreeMap::from([("dead_code@a.rs::f".to_string(), 1)]),
+            ..LintCounts::default()
         };
         let mutants = MutantCounts {
             total: 1,
@@ -636,6 +667,57 @@ mod tests {
             Some(&clean_mutants),
         );
         assert!(report.gate_passed());
+    }
+
+    #[test]
+    fn lint_items_are_grandfathered_per_key() {
+        let mut config = test_config();
+        config.baseline.dead_code = BTreeMap::from([
+            ("dead_code@a.rs::old".to_string(), 2),
+            ("unused_imports@a.rs#L3".to_string(), 1),
+        ]);
+        let rust = RustMetrics::default();
+        let lints = |items: &[(&str, usize)]| LintCounts {
+            dead_code: items.iter().map(|(_, n)| n).sum(),
+            dead_code_items: items.iter().map(|(k, n)| (k.to_string(), *n)).collect(),
+            ..LintCounts::default()
+        };
+        let gate = |l: &LintCounts| build(&config, &rust, None, None, Some(l), None);
+
+        // Grandfathered items at (or under) their ceilings pass; the row
+        // misses the target but passes the gate and shows the total.
+        let report = gate(&lints(&[
+            ("dead_code@a.rs::old", 2),
+            ("unused_imports@a.rs#L3", 1),
+        ]));
+        assert!(report.gate_passed(), "{:?}", report.violations);
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.metric == "Dead code findings")
+            .unwrap();
+        assert_eq!(row.value, "3");
+        assert!(!row.meets_target);
+        assert!(row.passes_gate);
+
+        // Fixing one finding and adding another elsewhere still fails.
+        let report = gate(&lints(&[
+            ("dead_code@a.rs::old", 1),
+            ("dead_code@a.rs::new", 1),
+        ]));
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].starts_with("dead code: dead_code@a.rs::new = 1"));
+        assert!(report.violations[0].contains("new violation"));
+
+        // Exceeding a grandfathered count is a regression.
+        let report = gate(&lints(&[("dead_code@a.rs::old", 3)]));
+        assert!(report.violations[0].contains("grandfathered ceiling 2"));
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.metric == "Dead code findings")
+            .unwrap();
+        assert!(!row.passes_gate);
     }
 
     #[test]

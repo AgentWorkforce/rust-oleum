@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::{config, coverage, rust_metrics};
+use crate::{config, coverage, external, rust_metrics};
 
 pub const CONFIG_FILE: &str = "rust-oleum.toml";
 
@@ -33,7 +33,12 @@ dead_code_max = 0
 redundant_code_max = 0
 ";
 
-pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Result<()> {
+pub fn run(
+    repo_root: &Path,
+    coverage_file: Option<&Path>,
+    clippy_log: Option<&Path>,
+    force: bool,
+) -> Result<()> {
     let path = repo_root.join(CONFIG_FILE);
     if path.exists() && !force {
         bail!("{CONFIG_FILE} already exists; pass --force to regenerate it");
@@ -59,8 +64,11 @@ pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Resul
         .transpose()?;
     let coverage_pct = cov.as_ref().map(coverage::Coverage::total_line_coverage);
     let crap = cov.as_ref().map(|c| c.crap_scores(&rust.functions));
+    let lints = clippy_log
+        .map(|p| external::parse_clippy_log(p, repo_root, &rust.functions))
+        .transpose()?;
 
-    let baseline = baseline_toml(&cfg, &rust, coverage_pct, crap.as_deref());
+    let baseline = baseline_toml(&cfg, &rust, coverage_pct, crap.as_deref(), lints.as_ref());
     let grandfathered = baseline.lines().filter(|l| l.contains('=')).count();
     text.push_str(&baseline);
     std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
@@ -155,6 +163,7 @@ pub fn baseline_toml(
     rust: &rust_metrics::RustMetrics,
     coverage_pct: Option<f64>,
     crap: Option<&[coverage::CrapScore]>,
+    lints: Option<&external::LintCounts>,
 ) -> String {
     use std::fmt::Write;
     let t = &config.targets;
@@ -238,6 +247,20 @@ pub fn baseline_toml(
                 .collect(),
         );
     }
+    if let Some(l) = lints {
+        let over = |items: &std::collections::BTreeMap<String, usize>, max: usize| {
+            items
+                .iter()
+                .filter(|(_, n)| **n > max)
+                .map(|(k, n)| (k.clone(), n.to_string()))
+                .collect()
+        };
+        section("dead_code", over(&l.dead_code_items, t.dead_code_max));
+        section(
+            "redundant_code",
+            over(&l.redundant_items, t.redundant_code_max),
+        );
+    }
     out
 }
 
@@ -275,7 +298,7 @@ mod tests {
         let big: String = (0..501).map(|i| format!("fn f{i}() {{}}\n")).collect();
         std::fs::write(dir.path().join("crates/a/src/big.rs"), big).unwrap();
 
-        run(dir.path(), None, false).unwrap();
+        run(dir.path(), None, None, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
         assert_eq!(config.targets.cyclomatic_max, 22);
         assert_eq!(config.sources.rust_roots, vec!["crates/a/src"]);
@@ -285,7 +308,38 @@ mod tests {
         );
 
         // Refuses to clobber without --force, allows it with.
-        assert!(run(dir.path(), None, false).is_err());
-        run(dir.path(), None, true).unwrap();
+        assert!(run(dir.path(), None, None, false).is_err());
+        run(dir.path(), None, None, true).unwrap();
+    }
+
+    #[test]
+    fn init_grandfathers_clippy_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_project(dir.path());
+        let diag = |code: &str, line: usize| {
+            format!(
+                r#"{{"reason":"compiler-message","message":{{"code":{{"code":"{code}"}},"message":"m","spans":[{{"file_name":"crates/a/src/lib.rs","line_start":{line},"column_start":1,"is_primary":true}}]}}}}"#
+            ) + "\n"
+        };
+        let log = diag("dead_code", 1) + &diag("clippy::needless_return", 5);
+        let log_path = dir.path().join("clippy.json");
+        std::fs::write(&log_path, log).unwrap();
+
+        run(dir.path(), None, Some(&log_path), false).unwrap();
+        let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(
+            config
+                .baseline
+                .dead_code
+                .get("dead_code@crates/a/src/lib.rs::tidy"),
+            Some(&1)
+        );
+        assert_eq!(
+            config
+                .baseline
+                .redundant_code
+                .get("clippy::needless_return@crates/a/src/lib.rs#L5"),
+            Some(&1)
+        );
     }
 }

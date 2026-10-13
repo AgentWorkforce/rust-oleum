@@ -30,7 +30,9 @@ pub struct Targets {
     pub coverage_min_pct: f64,
     pub crap_max: f64,
     pub surviving_mutants_max: usize,
+    /// Allowed dead-code findings per item (lint + function).
     pub dead_code_max: usize,
+    /// Allowed redundant-code findings per item (lint + function).
     pub redundant_code_max: usize,
 }
 
@@ -54,6 +56,12 @@ pub struct Baseline {
     /// "file::function" -> allowed CRAP ceiling.
     #[serde(default)]
     pub crap: BTreeMap<String, f64>,
+    /// "lint@file::function" (or "lint@file#Lline") -> allowed finding count.
+    #[serde(default)]
+    pub dead_code: BTreeMap<String, usize>,
+    /// "lint@file::function" (or "lint@file#Lline") -> allowed finding count.
+    #[serde(default)]
+    pub redundant_code: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize)]

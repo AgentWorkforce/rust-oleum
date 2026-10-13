@@ -38,8 +38,8 @@ struct Args {
     #[arg(long)]
     coverage: Option<PathBuf>,
 
-    /// JSON log from `cargo clippy --message-format=json` (enables dead /
-    /// redundant code counts).
+    /// JSON log from `cargo clippy --message-format=json` (enables per-item
+    /// dead / redundant code findings).
     #[arg(long)]
     clippy_log: Option<PathBuf>,
 
@@ -71,6 +71,10 @@ enum Command {
         /// CRAP ceilings.
         #[arg(long)]
         coverage: Option<PathBuf>,
+        /// JSON log from `cargo clippy --message-format=json` so the
+        /// baseline grandfathers today's dead / redundant code findings.
+        #[arg(long)]
+        clippy_log: Option<PathBuf>,
         /// Overwrite an existing config file.
         #[arg(long)]
         force: bool,
@@ -81,8 +85,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let repo_root = std::env::current_dir().context("resolving working directory")?;
 
-    if let Some(Command::Init { coverage, force }) = args.command {
-        return init::run(&repo_root, coverage.as_deref(), force);
+    if let Some(Command::Init {
+        coverage,
+        clippy_log,
+        force,
+    }) = args.command
+    {
+        return init::run(
+            &repo_root,
+            coverage.as_deref(),
+            clippy_log.as_deref(),
+            force,
+        );
     }
 
     let config = config::Config::load(&repo_root.join(&args.config))?;
@@ -99,7 +113,7 @@ fn main() -> Result<()> {
     let lints = args
         .clippy_log
         .as_deref()
-        .map(external::parse_clippy_log)
+        .map(|p| external::parse_clippy_log(p, &repo_root, &rust.functions))
         .transpose()?;
     let mutants = args
         .mutants
@@ -110,7 +124,13 @@ fn main() -> Result<()> {
     if args.write_baseline {
         print!(
             "{}",
-            init::baseline_toml(&config, &rust, coverage_pct, crap.as_deref())
+            init::baseline_toml(
+                &config,
+                &rust,
+                coverage_pct,
+                crap.as_deref(),
+                lints.as_ref()
+            )
         );
         return Ok(());
     }
