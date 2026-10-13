@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::report::insert_max;
 use crate::{config, coverage, external, report, rust_metrics};
 
 pub const CONFIG_FILE: &str = "rust-oleum.toml";
@@ -268,13 +269,6 @@ pub fn coverage_floor(pct: f64) -> f64 {
     report::tenths((pct - 0.5).max(0.0)) as f64 / 10.0
 }
 
-fn insert_max<V: PartialOrd + Copy>(map: &mut BTreeMap<String, V>, key: String, value: V) {
-    let slot = map.entry(key).or_insert(value);
-    if value > *slot {
-        *slot = value;
-    }
-}
-
 /// Render a baseline as the `[baseline]` TOML section (and its subtables).
 pub fn render_baseline(b: &config::Baseline) -> String {
     use std::fmt::Write;
@@ -464,5 +458,30 @@ mod tests {
         for i in 0..=2_000 {
             assert_round_trip(&empty, f64::from(i) * 0.0497, &[]);
         }
+    }
+
+    #[test]
+    fn values_exactly_at_target_are_not_grandfathered() {
+        let base = format!("{DEFAULT_TARGETS}\n[sources]\nrust_roots = [\"src\"]\n");
+        let cfg: config::Config = toml::from_str(&base).unwrap();
+        let rust = rust_metrics::RustMetrics {
+            files: vec![rust_metrics::FileMetrics {
+                file: "src/a.rs".into(),
+                loc: 500,
+                allow_count: 0,
+            }],
+            functions: vec![func("f", 22, 80.0)],
+        };
+        let lints = external::LintCounts {
+            dead_code_items: BTreeMap::from([("d".into(), 0)]),
+            redundant_items: BTreeMap::from([("r".into(), 1)]),
+            ..Default::default()
+        };
+        let b = baseline(&cfg, &rust, Some(100.0), None, Some(&lints));
+        let expected = config::Baseline {
+            redundant_code: BTreeMap::from([("r".into(), 1)]),
+            ..Default::default()
+        };
+        assert_eq!(b, expected);
     }
 }

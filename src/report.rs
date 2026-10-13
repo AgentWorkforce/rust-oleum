@@ -108,14 +108,19 @@ fn check_items<V: Ratchet>(
             }
         }
         if baseline.contains_key(&key) {
-            let slot = matched.entry(key).or_insert(value);
-            if value > *slot {
-                *slot = value;
-            }
+            insert_max(&mut matched, key, value);
         }
     }
     stale_entries(target, baseline, &matched, (metric, noun), violations);
     (worst, over_target)
+}
+
+/// Insert `value` under `key`, keeping the larger value when the key repeats.
+pub fn insert_max<V: PartialOrd + Copy>(map: &mut BTreeMap<String, V>, key: String, value: V) {
+    let slot = map.entry(key).or_insert(value);
+    *slot = std::cmp::max_by(*slot, value, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
 }
 
 /// Flag baseline entries that no longer pin a measured value exactly.
@@ -1147,5 +1152,21 @@ mod tests {
         // No floor configured: nothing to be stale.
         config.baseline.coverage_min_pct = None;
         assert!(build(&config, &rust, Some(100.0), None, None, None).gate_passed());
+    }
+
+    #[test]
+    fn coverage_slack_boundary_is_inclusive() {
+        let edge = COVERAGE_SLACK_PCT + 1e-9;
+        assert_eq!(stale_coverage_floor(edge, 100.0, Some(0.0)), None);
+        assert!(stale_coverage_floor(edge + 1e-6, 100.0, Some(0.0)).is_some());
+    }
+
+    #[test]
+    fn insert_max_keeps_the_larger_value_per_key() {
+        let mut m = BTreeMap::new();
+        for (k, v) in [("a", 2.0), ("a", 5.0), ("a", 3.0), ("b", 1.0)] {
+            insert_max(&mut m, k.into(), v);
+        }
+        assert_eq!(m, BTreeMap::from([("a".into(), 5.0), ("b".into(), 1.0)]));
     }
 }

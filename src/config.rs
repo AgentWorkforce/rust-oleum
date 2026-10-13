@@ -99,7 +99,7 @@ mod defaults {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Baseline {
     /// Enforced coverage floor while below the 100% target.

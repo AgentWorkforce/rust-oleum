@@ -300,4 +300,34 @@ mod tests {
         let reloaded = Config::load(&path).unwrap();
         assert_eq!(reloaded.baseline.cyclomatic.get("src/a.rs::f"), Some(&30));
     }
+
+    #[test]
+    fn equal_values_are_neither_lowered_nor_refused() {
+        let same = Baseline {
+            coverage_min_pct: Some(70.0),
+            ..baseline(&[("a::f", 30)])
+        };
+        let (tight, s) = clamp(&same, &same, ALL);
+        assert_eq!(tight, same);
+        assert_eq!(s, Summary::default());
+        assert_eq!(
+            s.to_string(),
+            "tightened baseline: 0 entries removed, 0 lowered"
+        );
+        let mut raised = same.clone();
+        raised.coverage_min_pct = Some(71.0);
+        assert_eq!(clamp(&same, &raised, ALL).1.lowered, 1);
+    }
+
+    #[test]
+    fn replace_appends_to_empty_or_newline_terminated_text() {
+        assert_eq!(
+            replace_baseline("", "[baseline]\n").unwrap(),
+            "[baseline]\n"
+        );
+        assert_eq!(
+            replace_baseline("x = 1\n", "[baseline]\n").unwrap(),
+            "x = 1\n\n[baseline]\n"
+        );
+    }
 }

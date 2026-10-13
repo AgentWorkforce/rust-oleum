@@ -469,4 +469,16 @@ mod tests {
         assert_eq!(counts.missed, 1);
         assert_eq!(counts.missed_examples, vec!["replace foo -> bar"]);
     }
+
+    #[test]
+    fn lint_item_key_picks_the_narrowest_enclosing_function() {
+        // Spans 9 vs 3 lines; sums and ratios would pick the outer one.
+        let fns = [
+            function("a.rs", "outer", 10, 19),
+            function("a.rs", "inner", 15, 18),
+        ];
+        assert_eq!(lint_item_key("c", "a.rs", 16, &fns), "c@a.rs::inner");
+        assert_eq!(lint_item_key("c", "a.rs", 12, &fns), "c@a.rs::outer");
+        assert_eq!(lint_item_key("c", "a.rs", 20, &fns), "c@a.rs#L20");
+    }
 }

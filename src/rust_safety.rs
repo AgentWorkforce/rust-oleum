@@ -309,4 +309,10 @@ mod tests {
         let attr: syn::Attribute = syn::parse_quote!(#[allow]);
         assert_eq!(allow_lints(&attr), 0);
     }
+
+    #[test]
+    fn only_non_test_modules_count_toward_file_allow() {
+        assert_eq!(file_count("mod m { #![allow(unused)] }"), 1);
+        assert_eq!(file_count("#[cfg(test)] mod t { #![allow(unused)] }"), 0);
+    }
 }
