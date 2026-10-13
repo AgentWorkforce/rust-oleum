@@ -31,6 +31,10 @@ crap_max = 25.0
 surviving_mutants_max = 0
 dead_code_max = 0
 redundant_code_max = 0
+unsafe_max = 0
+panic_max = 0
+allow_max = 0
+file_allow_max = 0
 ";
 
 pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Result<()> {
@@ -223,6 +227,9 @@ pub fn baseline_toml(
             })
             .collect(),
     );
+    for (name, entries) in safety_sections(config, rust) {
+        section(name, entries);
+    }
     if let Some(scores) = crap {
         section(
             "crap",
@@ -239,6 +246,34 @@ pub fn baseline_toml(
         );
     }
     out
+}
+
+/// Baseline entries for the Rust safety counts, by section name.
+fn safety_sections(
+    config: &config::Config,
+    rust: &rust_metrics::RustMetrics,
+) -> Vec<(&'static str, Vec<(String, String)>)> {
+    let t = &config.targets;
+    let per_fn = |field: fn(&rust_metrics::FunctionMetrics) -> u32, max: u32| {
+        rust.functions
+            .iter()
+            .filter(|f| field(f) > max)
+            .map(|f| (config::function_key(&f.file, &f.name), field(f).to_string()))
+            .collect()
+    };
+    vec![
+        ("unsafe", per_fn(|f| f.unsafe_count, t.unsafe_max)),
+        ("panic", per_fn(|f| f.panic_count, t.panic_max)),
+        ("allow", per_fn(|f| f.allow_count, t.allow_max)),
+        (
+            "file_allow",
+            rust.files
+                .iter()
+                .filter(|f| f.allow_count > t.file_allow_max)
+                .map(|f| (f.file.clone(), f.allow_count.to_string()))
+                .collect(),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -274,6 +309,12 @@ mod tests {
         // A file over the LOC target must land in the baseline.
         let big: String = (0..501).map(|i| format!("fn f{i}() {{}}\n")).collect();
         std::fs::write(dir.path().join("crates/a/src/big.rs"), big).unwrap();
+        // Safety offenders must be grandfathered too.
+        std::fs::write(
+            dir.path().join("crates/a/src/risky.rs"),
+            "#![allow(unused)]\n#[allow(dead_code)]\nunsafe fn r() { unsafe { x() }; y.unwrap(); }\n",
+        )
+        .unwrap();
 
         run(dir.path(), None, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
@@ -283,6 +324,12 @@ mod tests {
             config.baseline.file_loc.get("crates/a/src/big.rs"),
             Some(&501)
         );
+        let b = &config.baseline;
+        assert_eq!(b.unsafe_.get("crates/a/src/risky.rs::r"), Some(&2));
+        assert_eq!(b.panic.get("crates/a/src/risky.rs::r"), Some(&1));
+        assert_eq!(b.allow.get("crates/a/src/risky.rs::r"), Some(&1));
+        assert_eq!(b.file_allow.get("crates/a/src/risky.rs"), Some(&1));
+        assert!(!b.unsafe_.contains_key("crates/a/src/lib.rs::tidy"));
 
         // Refuses to clobber without --force, allows it with.
         assert!(run(dir.path(), None, false).is_err());

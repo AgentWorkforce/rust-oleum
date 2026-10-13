@@ -13,6 +13,10 @@ crap_max = 25.0
 surviving_mutants_max = 0
 dead_code_max = 0
 redundant_code_max = 0
+unsafe_max = 0
+panic_max = 0
+allow_max = 0
+file_allow_max = 0
 
 [sources]
 rust_roots = ["src"]
