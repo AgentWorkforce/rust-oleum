@@ -1,6 +1,7 @@
 //! Source-level metrics for Rust production code: per-function cyclomatic
 //! complexity, cognitive complexity (Sonar-style approximation), Halstead
-//! difficulty, and per-file logical lines of code.
+//! difficulty, per-file logical lines of code, and the Rust safety counts
+//! from [`crate::rust_safety`] (unsafe, panics, lint suppressions).
 //!
 //! Test code (`tests/` dirs, `*_tests.rs` / `tests.rs` files, `#[cfg(test)]`
 //! modules, `#[test]` functions) is excluded: the benchmark measures the
@@ -24,6 +25,12 @@ pub struct FunctionMetrics {
     pub cyclomatic: u32,
     pub cognitive: u32,
     pub halstead_difficulty: f64,
+    /// `unsafe` blocks in the body, plus one for an `unsafe fn`.
+    pub unsafe_count: u32,
+    /// `.unwrap()` / `.expect(..)` calls and panicking macros.
+    pub panic_count: u32,
+    /// Lints suppressed by `#[allow]` / `#[expect]` on or inside the fn.
+    pub allow_count: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -31,6 +38,8 @@ pub struct FileMetrics {
     pub file: String,
     /// Non-blank, non-comment lines, test modules excluded.
     pub loc: usize,
+    /// Lints suppressed outside functions (inner `#![allow]`, item attrs).
+    pub allow_count: u32,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +82,7 @@ pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics>
         out.files.push(FileMetrics {
             file: rel.clone(),
             loc: count_loc(&src, &ast),
+            allow_count: crate::rust_safety::file_allow_count(&ast),
         });
 
         let mut visitor = FnVisitor {
@@ -122,7 +132,7 @@ fn count_loc(src: &str, ast: &syn::File) -> usize {
 }
 
 /// `#[cfg(test)]` (or any cfg predicate mentioning `test`).
-fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| match &a.meta {
         syn::Meta::List(l) if l.path.is_ident("cfg") => {
             l.tokens.clone().into_iter().any(|t| match t {
@@ -151,7 +161,7 @@ struct FnVisitor<'a> {
 impl FnVisitor<'_> {
     fn record(
         &mut self,
-        name: &str,
+        sig: &syn::Signature,
         attrs: &[syn::Attribute],
         block: &syn::Block,
         span: proc_macro2::Span,
@@ -159,8 +169,10 @@ impl FnVisitor<'_> {
         if has_test_attr(attrs) {
             return;
         }
+        let name = sig.ident.to_string();
+        let safety = crate::rust_safety::measure_fn(sig, attrs, block);
         let qualified = if self.scope.is_empty() {
-            name.to_string()
+            name
         } else {
             format!("{}::{}", self.scope.join("::"), name)
         };
@@ -172,6 +184,9 @@ impl FnVisitor<'_> {
             cyclomatic: crate::complexity::cyclomatic(block),
             cognitive: crate::complexity::cognitive(block),
             halstead_difficulty: crate::complexity::halstead_difficulty(block),
+            unsafe_count: safety.unsafe_count,
+            panic_count: safety.panic_count,
+            allow_count: safety.allow_count,
         });
     }
 }
@@ -187,6 +202,10 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        // A `#[cfg(test)] impl` is test code; its methods carry no attr.
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
         self.scope.push(type_name_of(&node.self_ty));
         syn::visit::visit_item_impl(self, node);
         self.scope.pop();
@@ -194,26 +213,16 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         // No recursion: closures and nested fns score as part of this body.
-        self.record(
-            &node.sig.ident.to_string(),
-            &node.attrs,
-            &node.block,
-            node.span(),
-        );
+        self.record(&node.sig, &node.attrs, &node.block, node.span());
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.record(
-            &node.sig.ident.to_string(),
-            &node.attrs,
-            &node.block,
-            node.span(),
-        );
+        self.record(&node.sig, &node.attrs, &node.block, node.span());
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if let Some(block) = &node.default {
-            self.record(&node.sig.ident.to_string(), &node.attrs, block, node.span());
+            self.record(&node.sig, &node.attrs, block, node.span());
         }
     }
 }
@@ -268,6 +277,20 @@ mod tests {
     fn qualifies_impl_methods() {
         let fns = metrics_for("struct S; impl S { fn go(&self) {} }");
         assert_eq!(fns[0].name, "S::go");
+    }
+
+    #[test]
+    fn skips_cfg_test_impl_blocks() {
+        let fns = metrics_for(
+            r#"
+            struct S;
+            impl S { fn shipped(&self) {} }
+            #[cfg(test)]
+            impl S { fn helper(&self) { x.unwrap() } }
+            "#,
+        );
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["S::shipped"]);
     }
 
     #[test]

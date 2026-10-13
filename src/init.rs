@@ -2,11 +2,13 @@
 //! a starter config whose `[baseline]` grandfathers today's violations so
 //! the gate can be enforced in CI immediately.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::{config, coverage, rust_metrics};
+use crate::report::insert_max;
+use crate::{config, coverage, external, report, rust_metrics};
 
 pub const CONFIG_FILE: &str = "rust-oleum.toml";
 
@@ -16,8 +18,8 @@ const HEADER: &str = "\
 # [targets] are the aspirational limits every metric is reported against.
 # [baseline] grandfathers existing violations at their current ceiling so
 # the gate can be enforced today: new violations, and regressions beyond a
-# grandfathered ceiling, fail CI. Shrink the baseline as code improves
-# (`rust-oleum --write-baseline` regenerates it); never grow it.
+# grandfathered ceiling, fail CI. So do loose or stale entries: when code
+# improves, `rust-oleum --tighten` shrinks this section in place.
 ";
 
 const DEFAULT_TARGETS: &str = "\
@@ -31,9 +33,18 @@ crap_max = 25.0
 surviving_mutants_max = 0
 dead_code_max = 0
 redundant_code_max = 0
+unsafe_max = 0
+panic_max = 0
+allow_max = 0
+file_allow_max = 0
 ";
 
-pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Result<()> {
+pub fn run(
+    repo_root: &Path,
+    coverage_file: Option<&Path>,
+    clippy_log: Option<&Path>,
+    force: bool,
+) -> Result<()> {
     let path = repo_root.join(CONFIG_FILE);
     if path.exists() && !force {
         bail!("{CONFIG_FILE} already exists; pass --force to regenerate it");
@@ -59,8 +70,11 @@ pub fn run(repo_root: &Path, coverage_file: Option<&Path>, force: bool) -> Resul
         .transpose()?;
     let coverage_pct = cov.as_ref().map(coverage::Coverage::total_line_coverage);
     let crap = cov.as_ref().map(|c| c.crap_scores(&rust.functions));
+    let lints = clippy_log
+        .map(|p| external::parse_clippy_log(p, repo_root, &rust.functions))
+        .transpose()?;
 
-    let baseline = baseline_toml(&cfg, &rust, coverage_pct, crap.as_deref());
+    let baseline = baseline_toml(&cfg, &rust, coverage_pct, crap.as_deref(), lints.as_ref());
     let grandfathered = baseline.lines().filter(|l| l.contains('=')).count();
     text.push_str(&baseline);
     std::fs::write(&path, &text).with_context(|| format!("writing {}", path.display()))?;
@@ -155,90 +169,139 @@ pub fn baseline_toml(
     rust: &rust_metrics::RustMetrics,
     coverage_pct: Option<f64>,
     crap: Option<&[coverage::CrapScore]>,
+    lints: Option<&external::LintCounts>,
 ) -> String {
-    use std::fmt::Write;
-    let t = &config.targets;
-    let mut out = String::from("[baseline]\n");
-    if let Some(pct) = coverage_pct {
-        if pct < t.coverage_min_pct {
-            // Floor slightly below the measured value so unrelated PRs don't
-            // flap on fractional coverage noise.
-            let _ = writeln!(out, "coverage_min_pct = {:.1}", (pct - 0.5).max(0.0));
-        }
-    }
-    let mut section = |name: &str, entries: Vec<(String, String)>| {
-        if entries.is_empty() {
-            return;
-        }
-        let _ = writeln!(out, "\n[baseline.{name}]");
-        for (k, v) in entries {
-            let _ = writeln!(out, "\"{k}\" = {v}");
-        }
-    };
+    render_baseline(&baseline(config, rust, coverage_pct, crap, lints))
+}
 
-    section(
-        "file_loc",
-        rust.files
-            .iter()
-            .filter(|f| f.loc > t.file_loc_max)
-            .map(|f| (f.file.clone(), f.loc.to_string()))
-            .collect(),
-    );
-    section(
-        "cyclomatic",
-        rust.functions
-            .iter()
-            .filter(|f| f.cyclomatic > t.cyclomatic_max)
-            .map(|f| {
-                (
-                    config::function_key(&f.file, &f.name),
-                    f.cyclomatic.to_string(),
-                )
-            })
-            .collect(),
-    );
-    section(
-        "cognitive",
-        rust.functions
-            .iter()
-            .filter(|f| f.cognitive > t.cognitive_max)
-            .map(|f| {
-                (
-                    config::function_key(&f.file, &f.name),
-                    f.cognitive.to_string(),
-                )
-            })
-            .collect(),
-    );
-    section(
-        "halstead",
-        rust.functions
-            .iter()
-            .filter(|f| f.halstead_difficulty > t.halstead_difficulty_max)
-            .map(|f| {
-                (
-                    config::function_key(&f.file, &f.name),
-                    format!("{:.1}", f.halstead_difficulty + 0.1),
-                )
-            })
-            .collect(),
-    );
-    if let Some(scores) = crap {
-        section(
-            "crap",
-            scores
-                .iter()
-                .filter(|s| s.crap > t.crap_max)
-                .map(|s| {
-                    (
-                        config::function_key(&s.file, &s.name),
-                        format!("{:.1}", s.crap + 0.1),
-                    )
-                })
-                .collect(),
+/// Baseline entries pinning every current target violation at its
+/// measured value (floats get one tenth of headroom, coverage half a point).
+pub fn baseline(
+    config: &config::Config,
+    rust: &rust_metrics::RustMetrics,
+    coverage_pct: Option<f64>,
+    crap: Option<&[coverage::CrapScore]>,
+    lints: Option<&external::LintCounts>,
+) -> config::Baseline {
+    let t = &config.targets;
+    let mut b = config::Baseline {
+        coverage_min_pct: coverage_pct
+            .filter(|pct| *pct < t.coverage_min_pct)
+            .map(coverage_floor),
+        ..Default::default()
+    };
+    file_entries(t, rust, &mut b);
+    function_entries(t, rust, &mut b);
+    for s in crap
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| s.crap > t.crap_max)
+    {
+        let key = config::function_key(&s.file, &s.name);
+        insert_max(&mut b.crap, key, float_ceiling(s.crap));
+    }
+    if let Some(l) = lints {
+        over_items(&l.dead_code_items, t.dead_code_max, &mut b.dead_code);
+        over_items(
+            &l.redundant_items,
+            t.redundant_code_max,
+            &mut b.redundant_code,
         );
     }
+    b
+}
+
+fn file_entries(t: &config::Targets, rust: &rust_metrics::RustMetrics, b: &mut config::Baseline) {
+    for f in &rust.files {
+        if f.loc > t.file_loc_max {
+            insert_max(&mut b.file_loc, f.file.clone(), f.loc);
+        }
+        if f.allow_count > t.file_allow_max {
+            insert_max(&mut b.file_allow, f.file.clone(), f.allow_count);
+        }
+    }
+}
+
+fn function_entries(
+    t: &config::Targets,
+    rust: &rust_metrics::RustMetrics,
+    b: &mut config::Baseline,
+) {
+    for f in &rust.functions {
+        let key = || config::function_key(&f.file, &f.name);
+        if f.cyclomatic > t.cyclomatic_max {
+            insert_max(&mut b.cyclomatic, key(), f.cyclomatic);
+        }
+        if f.cognitive > t.cognitive_max {
+            insert_max(&mut b.cognitive, key(), f.cognitive);
+        }
+        if f.halstead_difficulty > t.halstead_difficulty_max {
+            insert_max(&mut b.halstead, key(), float_ceiling(f.halstead_difficulty));
+        }
+        if f.unsafe_count > t.unsafe_max {
+            insert_max(&mut b.unsafe_, key(), f.unsafe_count);
+        }
+        if f.panic_count > t.panic_max {
+            insert_max(&mut b.panic, key(), f.panic_count);
+        }
+        if f.allow_count > t.allow_max {
+            insert_max(&mut b.allow, key(), f.allow_count);
+        }
+    }
+}
+
+/// Copy every item whose count exceeds `max` into the baseline map.
+fn over_items(items: &BTreeMap<String, usize>, max: usize, out: &mut BTreeMap<String, usize>) {
+    for (k, n) in items.iter().filter(|(_, n)| **n > max) {
+        insert_max(out, k.clone(), *n);
+    }
+}
+
+/// Ceiling for a one-decimal float metric: the displayed value plus a tenth,
+/// so the gate's stale-ceiling check (one tenth of slack) accepts it.
+pub fn float_ceiling(x: f64) -> f64 {
+    (report::tenths(x) + 1) as f64 / 10.0
+}
+
+/// Coverage floor slightly below the measured value so unrelated PRs don't
+/// flap on fractional coverage noise.
+pub fn coverage_floor(pct: f64) -> f64 {
+    report::tenths((pct - 0.5).max(0.0)) as f64 / 10.0
+}
+
+/// Render a baseline as the `[baseline]` TOML section (and its subtables).
+pub fn render_baseline(b: &config::Baseline) -> String {
+    use std::fmt::Write;
+    let mut out = String::from("[baseline]\n");
+    if let Some(floor) = b.coverage_min_pct {
+        let _ = writeln!(out, "coverage_min_pct = {floor:?}");
+    }
+    section(&mut out, "file_loc", &b.file_loc, |v| v.to_string());
+    section(&mut out, "cyclomatic", &b.cyclomatic, |v| v.to_string());
+    section(&mut out, "cognitive", &b.cognitive, |v| v.to_string());
+    section(&mut out, "halstead", &b.halstead, |v| format!("{v:?}"));
+    section(&mut out, "crap", &b.crap, |v| format!("{v:?}"));
+    section(&mut out, "unsafe", &b.unsafe_, |v| v.to_string());
+    section(&mut out, "panic", &b.panic, |v| v.to_string());
+    section(&mut out, "allow", &b.allow, |v| v.to_string());
+    section(&mut out, "file_allow", &b.file_allow, |v| v.to_string());
+    section(&mut out, "dead_code", &b.dead_code, |v| v.to_string());
+    section(&mut out, "redundant_code", &b.redundant_code, |v| {
+        v.to_string()
+    });
     out
+}
+
+fn section<V>(out: &mut String, name: &str, entries: &BTreeMap<String, V>, fmt: fn(&V) -> String) {
+    use std::fmt::Write;
+    if entries.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n[baseline.{name}]");
+    for (k, v) in entries {
+        let key = k.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = writeln!(out, "\"{key}\" = {}", fmt(v));
+    }
 }
 
 #[cfg(test)]
@@ -274,8 +337,14 @@ mod tests {
         // A file over the LOC target must land in the baseline.
         let big: String = (0..501).map(|i| format!("fn f{i}() {{}}\n")).collect();
         std::fs::write(dir.path().join("crates/a/src/big.rs"), big).unwrap();
+        // Safety offenders must be grandfathered too.
+        std::fs::write(
+            dir.path().join("crates/a/src/risky.rs"),
+            "#![allow(unused)]\n#[allow(dead_code)]\nunsafe fn r() { unsafe { x() }; y.unwrap(); }\n",
+        )
+        .unwrap();
 
-        run(dir.path(), None, false).unwrap();
+        run(dir.path(), None, None, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
         assert_eq!(config.targets.cyclomatic_max, 22);
         assert_eq!(config.sources.rust_roots, vec!["crates/a/src"]);
@@ -283,9 +352,136 @@ mod tests {
             config.baseline.file_loc.get("crates/a/src/big.rs"),
             Some(&501)
         );
+        let b = &config.baseline;
+        assert_eq!(b.unsafe_.get("crates/a/src/risky.rs::r"), Some(&2));
+        assert_eq!(b.panic.get("crates/a/src/risky.rs::r"), Some(&1));
+        assert_eq!(b.allow.get("crates/a/src/risky.rs::r"), Some(&1));
+        assert_eq!(b.file_allow.get("crates/a/src/risky.rs"), Some(&1));
+        assert!(!b.unsafe_.contains_key("crates/a/src/lib.rs::tidy"));
 
         // Refuses to clobber without --force, allows it with.
-        assert!(run(dir.path(), None, false).is_err());
-        run(dir.path(), None, true).unwrap();
+        assert!(run(dir.path(), None, None, false).is_err());
+        run(dir.path(), None, None, true).unwrap();
+    }
+
+    #[test]
+    fn init_grandfathers_clippy_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_project(dir.path());
+        let diag = |code: &str, line: usize| {
+            format!(
+                r#"{{"reason":"compiler-message","message":{{"code":{{"code":"{code}"}},"message":"m","spans":[{{"file_name":"crates/a/src/lib.rs","line_start":{line},"column_start":1,"is_primary":true}}]}}}}"#
+            ) + "\n"
+        };
+        let log = diag("dead_code", 1) + &diag("clippy::needless_return", 5);
+        let log_path = dir.path().join("clippy.json");
+        std::fs::write(&log_path, log).unwrap();
+
+        run(dir.path(), None, Some(&log_path), false).unwrap();
+        let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert_eq!(
+            config
+                .baseline
+                .dead_code
+                .get("dead_code@crates/a/src/lib.rs::tidy"),
+            Some(&1)
+        );
+        assert_eq!(
+            config
+                .baseline
+                .redundant_code
+                .get("clippy::needless_return@crates/a/src/lib.rs#L5"),
+            Some(&1)
+        );
+    }
+
+    fn func(name: &str, cx: u32, halstead: f64) -> rust_metrics::FunctionMetrics {
+        rust_metrics::FunctionMetrics {
+            file: "src/a.rs".into(),
+            name: name.into(),
+            start_line: 1,
+            end_line: 2,
+            cyclomatic: cx,
+            cognitive: cx,
+            halstead_difficulty: halstead,
+            unsafe_count: 0,
+            panic_count: 0,
+            allow_count: 0,
+        }
+    }
+
+    /// Paste `baseline_toml` output back into a config and gate the same
+    /// measurements: it must pass with no stale, loose, or unmatched entries.
+    fn assert_round_trip(rust: &rust_metrics::RustMetrics, pct: f64, crap: &[coverage::CrapScore]) {
+        let base = format!("{DEFAULT_TARGETS}\n[sources]\nrust_roots = [\"src\"]\n\n");
+        let cfg: config::Config = toml::from_str(&base).unwrap();
+        let text = format!(
+            "{base}{}",
+            baseline_toml(&cfg, rust, Some(pct), Some(crap), None)
+        );
+        let cfg: config::Config = toml::from_str(&text).unwrap();
+        let report = report::build(&cfg, rust, Some(pct), Some(crap), None, None);
+        assert!(report.gate_passed(), "{text}\n{:?}", report.violations);
+    }
+
+    #[test]
+    fn write_baseline_output_round_trips_through_the_gate() {
+        let functions: Vec<_> = (0..2000)
+            .map(|i| func(&format!("f{i}"), 23 + i % 7, 80.0 + f64::from(i) * 0.0137))
+            .collect();
+        let crap: Vec<_> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| coverage::CrapScore {
+                file: f.file.clone(),
+                name: f.name.clone(),
+                cyclomatic: f.cyclomatic,
+                coverage_pct: 0.0,
+                crap: 25.0 + i as f64 * 0.0451,
+            })
+            .collect();
+        let mut rust = rust_metrics::RustMetrics {
+            files: vec![rust_metrics::FileMetrics {
+                file: "src/a.rs".into(),
+                loc: 812,
+                allow_count: 0,
+            }],
+            functions,
+        };
+        // Keys needing TOML escaping survive, and duplicate keys keep the max.
+        rust.functions.push(func("Q<\"x\\y\">::f", 30, 90.0));
+        rust.functions.push(func("dup", 30, 81.0));
+        rust.functions.push(func("dup", 25, 95.0));
+        assert_round_trip(&rust, 73.21, &crap);
+
+        let empty = rust_metrics::RustMetrics::default();
+        for i in 0..=2_000 {
+            assert_round_trip(&empty, f64::from(i) * 0.0497, &[]);
+        }
+    }
+
+    #[test]
+    fn values_exactly_at_target_are_not_grandfathered() {
+        let base = format!("{DEFAULT_TARGETS}\n[sources]\nrust_roots = [\"src\"]\n");
+        let cfg: config::Config = toml::from_str(&base).unwrap();
+        let rust = rust_metrics::RustMetrics {
+            files: vec![rust_metrics::FileMetrics {
+                file: "src/a.rs".into(),
+                loc: 500,
+                allow_count: 0,
+            }],
+            functions: vec![func("f", 22, 80.0)],
+        };
+        let lints = external::LintCounts {
+            dead_code_items: BTreeMap::from([("d".into(), 0)]),
+            redundant_items: BTreeMap::from([("r".into(), 1)]),
+            ..Default::default()
+        };
+        let b = baseline(&cfg, &rust, Some(100.0), None, Some(&lints));
+        let expected = config::Baseline {
+            redundant_code: BTreeMap::from([("r".into(), 1)]),
+            ..Default::default()
+        };
+        assert_eq!(b, expected);
     }
 }
