@@ -111,13 +111,21 @@ impl<'ast> Visit<'ast> for BodyVisitor {
         if last_ident_is(&node.path, PANIC_MACROS) {
             self.counts.panic_count += 1;
         }
-        // Look inside macro arguments: split the body on top-level `,` and
-        // `;` so `vec![x; n]` and `format!("{}", x)` alike are traversed, and
-        // visit every piece that parses as an expression.
-        for piece in split_macro_args(node.tokens.clone()) {
-            if let Ok(expr) = syn::parse2::<syn::Expr>(piece) {
-                self.visit_expr(&expr);
-            }
+        // Look inside macro arguments. A comma-separated expression list
+        // (`format!("{}", x)`) is parsed with the real grammar, so commas in
+        // turbofish or closure parameters stay intact. Bodies that are not
+        // such a list (`vec![x; n]`) fall back to a split on top-level `,`
+        // and `;`, visiting every piece that parses as an expression.
+        let pieces =
+            match node.parse_body_with(Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated) {
+                Ok(args) => args.into_iter().collect(),
+                Err(_) => split_macro_args(node.tokens.clone())
+                    .into_iter()
+                    .filter_map(|piece| syn::parse2::<syn::Expr>(piece).ok())
+                    .collect::<Vec<_>>(),
+            };
+        for expr in &pieces {
+            self.visit_expr(expr);
         }
     }
 
@@ -269,6 +277,20 @@ mod tests {
             }"#,
         );
         assert_eq!(c.panic_count, 5);
+    }
+
+    #[test]
+    fn top_level_commas_in_turbofish_and_closures_stay_intact() {
+        // These commas sit at the macro body's top token level; a naive
+        // split would tear the expressions apart and lose the panics.
+        let c = fn_counts(
+            r#"fn f() {
+                assert!(parse::<A, B>(x).unwrap());
+                println!("{}", (|a, b| a.unwrap() + b)(1, 2));
+                let v = vec![parse::<A, B>(y).unwrap(); 3];
+            }"#,
+        );
+        assert_eq!(c.panic_count, 4);
     }
 
     #[test]
