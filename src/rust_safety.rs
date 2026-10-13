@@ -111,12 +111,12 @@ impl<'ast> Visit<'ast> for BodyVisitor {
         if last_ident_is(&node.path, PANIC_MACROS) {
             self.counts.panic_count += 1;
         }
-        // Look inside macro arguments that parse as expressions.
-        if let Ok(args) =
-            node.parse_body_with(Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated)
-        {
-            for arg in &args {
-                self.visit_expr(arg);
+        // Look inside macro arguments: split the body on top-level `,` and
+        // `;` so `vec![x; n]` and `format!("{}", x)` alike are traversed, and
+        // visit every piece that parses as an expression.
+        for piece in split_macro_args(node.tokens.clone()) {
+            if let Ok(expr) = syn::parse2::<syn::Expr>(piece) {
+                self.visit_expr(&expr);
             }
         }
     }
@@ -124,6 +124,24 @@ impl<'ast> Visit<'ast> for BodyVisitor {
     fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
         self.counts.allow_count += allow_lints(node);
     }
+}
+
+/// Split a macro body into the token runs between top-level `,` and `;`.
+fn split_macro_args(tokens: proc_macro2::TokenStream) -> Vec<proc_macro2::TokenStream> {
+    let mut pieces = Vec::new();
+    let mut current = proc_macro2::TokenStream::new();
+    for tree in tokens {
+        match &tree {
+            proc_macro2::TokenTree::Punct(p) if p.as_char() == ',' || p.as_char() == ';' => {
+                pieces.push(std::mem::take(&mut current));
+            }
+            _ => current.extend(std::iter::once(tree)),
+        }
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
 }
 
 struct FileAllowVisitor {
@@ -237,6 +255,20 @@ mod tests {
             }"#,
         );
         assert_eq!(c.panic_count, 4);
+    }
+
+    #[test]
+    fn panics_inside_semicolon_separated_macro_bodies_are_counted() {
+        // `vec![x; n]` is not a comma-separated expression list, so a
+        // comma-only parse would skip it; splitting on `;` must find both.
+        let c = fn_counts(
+            r#"fn f() {
+                let v = vec![a.unwrap(); n.expect("len")];
+                let w = vec![b.unwrap(), c.unwrap()];
+                let m = matches!(d.unwrap(), Some(_));
+            }"#,
+        );
+        assert_eq!(c.panic_count, 5);
     }
 
     #[test]

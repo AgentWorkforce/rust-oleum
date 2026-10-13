@@ -127,7 +127,8 @@ of leaving room to slide back. The gate fails when:
   meets the target.
 
 Entries for metrics that weren't measured in a run (CRAP and coverage
-without `--coverage`) are left alone.
+without `--coverage`, dead/redundant code without `--clippy-log`) are
+left alone.
 
 `rust-oleum --tighten` fixes all of this in place: it rewrites the
 `[baseline]` section of `rust-oleum.toml` (everything above it is kept

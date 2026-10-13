@@ -202,6 +202,10 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        // A `#[cfg(test)] impl` is test code; its methods carry no attr.
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
         self.scope.push(type_name_of(&node.self_ty));
         syn::visit::visit_item_impl(self, node);
         self.scope.pop();
@@ -273,6 +277,20 @@ mod tests {
     fn qualifies_impl_methods() {
         let fns = metrics_for("struct S; impl S { fn go(&self) {} }");
         assert_eq!(fns[0].name, "S::go");
+    }
+
+    #[test]
+    fn skips_cfg_test_impl_blocks() {
+        let fns = metrics_for(
+            r#"
+            struct S;
+            impl S { fn shipped(&self) {} }
+            #[cfg(test)]
+            impl S { fn helper(&self) { x.unwrap() } }
+            "#,
+        );
+        let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["S::shipped"]);
     }
 
     #[test]
