@@ -1,9 +1,8 @@
 # rust-oleum configuration — https://github.com/AgentWorkforce/rust-oleum
 #
-# This is rust-oleum's own gate. The source metrics meet every target; the
-# baseline grandfathers the CLI entry point (src/main.rs), which is exercised
-# by running the binary rather than by unit tests, so its coverage and CRAP
-# scores lag. `rust-oleum --tighten` shrinks it as that improves.
+# This is rust-oleum's own gate. Every per-item metric meets its target;
+# the only grandfathered debt is the line-coverage floor, which
+# `rust-oleum --tighten` raises as coverage climbs toward 100%.
 
 [targets]
 cyclomatic_max = 22
@@ -24,8 +23,4 @@ file_allow_max = 0
 rust_roots = ["src"]
 
 [baseline]
-coverage_min_pct = 94.7
-
-[baseline.crap]
-"src/main.rs::main" = 380.1
-"src/main.rs::write_github_summary" = 42.1
+coverage_min_pct = 98.8

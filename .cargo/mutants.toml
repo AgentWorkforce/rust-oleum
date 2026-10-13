@@ -1,5 +1,3 @@
-# cargo-mutants configuration. main.rs is CLI orchestration and report
-# printing — exercised by running the binary, not by unit tests — so
-# mutating it only produces noise. The analyzer/parser modules stay
-# fully mutated.
-exclude_globs = ["src/main.rs"]
+# cargo-mutants configuration. Every module is mutated, including the CLI
+# entry point in main.rs, which tests/cli.rs exercises by running the binary.
+exclude_globs = []
