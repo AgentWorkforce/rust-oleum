@@ -2,11 +2,12 @@
 //! a starter config whose `[baseline]` grandfathers today's violations so
 //! the gate can be enforced in CI immediately.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::{config, coverage, rust_metrics};
+use crate::{config, coverage, report, rust_metrics};
 
 pub const CONFIG_FILE: &str = "rust-oleum.toml";
 
@@ -16,8 +17,8 @@ const HEADER: &str = "\
 # [targets] are the aspirational limits every metric is reported against.
 # [baseline] grandfathers existing violations at their current ceiling so
 # the gate can be enforced today: new violations, and regressions beyond a
-# grandfathered ceiling, fail CI. Shrink the baseline as code improves
-# (`rust-oleum --write-baseline` regenerates it); never grow it.
+# grandfathered ceiling, fail CI. So do loose or stale entries: when code
+# improves, `rust-oleum --tighten` shrinks this section in place.
 ";
 
 const DEFAULT_TARGETS: &str = "\
@@ -156,89 +157,94 @@ pub fn baseline_toml(
     coverage_pct: Option<f64>,
     crap: Option<&[coverage::CrapScore]>,
 ) -> String {
-    use std::fmt::Write;
-    let t = &config.targets;
-    let mut out = String::from("[baseline]\n");
-    if let Some(pct) = coverage_pct {
-        if pct < t.coverage_min_pct {
-            // Floor slightly below the measured value so unrelated PRs don't
-            // flap on fractional coverage noise.
-            let _ = writeln!(out, "coverage_min_pct = {:.1}", (pct - 0.5).max(0.0));
-        }
-    }
-    let mut section = |name: &str, entries: Vec<(String, String)>| {
-        if entries.is_empty() {
-            return;
-        }
-        let _ = writeln!(out, "\n[baseline.{name}]");
-        for (k, v) in entries {
-            let _ = writeln!(out, "\"{k}\" = {v}");
-        }
-    };
+    render_baseline(&baseline(config, rust, coverage_pct, crap))
+}
 
-    section(
-        "file_loc",
-        rust.files
-            .iter()
-            .filter(|f| f.loc > t.file_loc_max)
-            .map(|f| (f.file.clone(), f.loc.to_string()))
-            .collect(),
-    );
-    section(
-        "cyclomatic",
-        rust.functions
-            .iter()
-            .filter(|f| f.cyclomatic > t.cyclomatic_max)
-            .map(|f| {
-                (
-                    config::function_key(&f.file, &f.name),
-                    f.cyclomatic.to_string(),
-                )
-            })
-            .collect(),
-    );
-    section(
-        "cognitive",
-        rust.functions
-            .iter()
-            .filter(|f| f.cognitive > t.cognitive_max)
-            .map(|f| {
-                (
-                    config::function_key(&f.file, &f.name),
-                    f.cognitive.to_string(),
-                )
-            })
-            .collect(),
-    );
-    section(
-        "halstead",
-        rust.functions
-            .iter()
-            .filter(|f| f.halstead_difficulty > t.halstead_difficulty_max)
-            .map(|f| {
-                (
-                    config::function_key(&f.file, &f.name),
-                    format!("{:.1}", f.halstead_difficulty + 0.1),
-                )
-            })
-            .collect(),
-    );
-    if let Some(scores) = crap {
-        section(
-            "crap",
-            scores
-                .iter()
-                .filter(|s| s.crap > t.crap_max)
-                .map(|s| {
-                    (
-                        config::function_key(&s.file, &s.name),
-                        format!("{:.1}", s.crap + 0.1),
-                    )
-                })
-                .collect(),
-        );
+/// Baseline entries pinning every current target violation at its
+/// measured value (floats get one tenth of headroom, coverage half a point).
+pub fn baseline(
+    config: &config::Config,
+    rust: &rust_metrics::RustMetrics,
+    coverage_pct: Option<f64>,
+    crap: Option<&[coverage::CrapScore]>,
+) -> config::Baseline {
+    let t = &config.targets;
+    let mut b = config::Baseline {
+        coverage_min_pct: coverage_pct
+            .filter(|pct| *pct < t.coverage_min_pct)
+            .map(coverage_floor),
+        ..Default::default()
+    };
+    for f in rust.files.iter().filter(|f| f.loc > t.file_loc_max) {
+        insert_max(&mut b.file_loc, f.file.clone(), f.loc);
     }
+    for f in &rust.functions {
+        let key = || config::function_key(&f.file, &f.name);
+        if f.cyclomatic > t.cyclomatic_max {
+            insert_max(&mut b.cyclomatic, key(), f.cyclomatic);
+        }
+        if f.cognitive > t.cognitive_max {
+            insert_max(&mut b.cognitive, key(), f.cognitive);
+        }
+        if f.halstead_difficulty > t.halstead_difficulty_max {
+            insert_max(&mut b.halstead, key(), float_ceiling(f.halstead_difficulty));
+        }
+    }
+    for s in crap
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| s.crap > t.crap_max)
+    {
+        let key = config::function_key(&s.file, &s.name);
+        insert_max(&mut b.crap, key, float_ceiling(s.crap));
+    }
+    b
+}
+
+/// Ceiling for a one-decimal float metric: the displayed value plus a tenth,
+/// so the gate's stale-ceiling check (one tenth of slack) accepts it.
+pub fn float_ceiling(x: f64) -> f64 {
+    (report::tenths(x) + 1) as f64 / 10.0
+}
+
+/// Coverage floor slightly below the measured value so unrelated PRs don't
+/// flap on fractional coverage noise.
+pub fn coverage_floor(pct: f64) -> f64 {
+    report::tenths((pct - 0.5).max(0.0)) as f64 / 10.0
+}
+
+fn insert_max<V: PartialOrd + Copy>(map: &mut BTreeMap<String, V>, key: String, value: V) {
+    let slot = map.entry(key).or_insert(value);
+    if value > *slot {
+        *slot = value;
+    }
+}
+
+/// Render a baseline as the `[baseline]` TOML section (and its subtables).
+pub fn render_baseline(b: &config::Baseline) -> String {
+    use std::fmt::Write;
+    let mut out = String::from("[baseline]\n");
+    if let Some(floor) = b.coverage_min_pct {
+        let _ = writeln!(out, "coverage_min_pct = {floor:?}");
+    }
+    section(&mut out, "file_loc", &b.file_loc, |v| v.to_string());
+    section(&mut out, "cyclomatic", &b.cyclomatic, |v| v.to_string());
+    section(&mut out, "cognitive", &b.cognitive, |v| v.to_string());
+    section(&mut out, "halstead", &b.halstead, |v| format!("{v:?}"));
+    section(&mut out, "crap", &b.crap, |v| format!("{v:?}"));
     out
+}
+
+fn section<V>(out: &mut String, name: &str, entries: &BTreeMap<String, V>, fmt: fn(&V) -> String) {
+    use std::fmt::Write;
+    if entries.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n[baseline.{name}]");
+    for (k, v) in entries {
+        let key = k.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = writeln!(out, "\"{key}\" = {}", fmt(v));
+    }
 }
 
 #[cfg(test)]
@@ -287,5 +293,63 @@ mod tests {
         // Refuses to clobber without --force, allows it with.
         assert!(run(dir.path(), None, false).is_err());
         run(dir.path(), None, true).unwrap();
+    }
+
+    fn func(name: &str, cx: u32, halstead: f64) -> rust_metrics::FunctionMetrics {
+        rust_metrics::FunctionMetrics {
+            file: "src/a.rs".into(),
+            name: name.into(),
+            start_line: 1,
+            end_line: 2,
+            cyclomatic: cx,
+            cognitive: cx,
+            halstead_difficulty: halstead,
+        }
+    }
+
+    /// Paste `baseline_toml` output back into a config and gate the same
+    /// measurements: it must pass with no stale, loose, or unmatched entries.
+    fn assert_round_trip(rust: &rust_metrics::RustMetrics, pct: f64, crap: &[coverage::CrapScore]) {
+        let base = format!("{DEFAULT_TARGETS}\n[sources]\nrust_roots = [\"src\"]\n\n");
+        let cfg: config::Config = toml::from_str(&base).unwrap();
+        let text = format!("{base}{}", baseline_toml(&cfg, rust, Some(pct), Some(crap)));
+        let cfg: config::Config = toml::from_str(&text).unwrap();
+        let report = report::build(&cfg, rust, Some(pct), Some(crap), None, None);
+        assert!(report.gate_passed(), "{text}\n{:?}", report.violations);
+    }
+
+    #[test]
+    fn write_baseline_output_round_trips_through_the_gate() {
+        let functions: Vec<_> = (0..2000)
+            .map(|i| func(&format!("f{i}"), 23 + i % 7, 80.0 + f64::from(i) * 0.0137))
+            .collect();
+        let crap: Vec<_> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| coverage::CrapScore {
+                file: f.file.clone(),
+                name: f.name.clone(),
+                cyclomatic: f.cyclomatic,
+                coverage_pct: 0.0,
+                crap: 25.0 + i as f64 * 0.0451,
+            })
+            .collect();
+        let mut rust = rust_metrics::RustMetrics {
+            files: vec![rust_metrics::FileMetrics {
+                file: "src/a.rs".into(),
+                loc: 812,
+            }],
+            functions,
+        };
+        // Keys needing TOML escaping survive, and duplicate keys keep the max.
+        rust.functions.push(func("Q<\"x\\y\">::f", 30, 90.0));
+        rust.functions.push(func("dup", 30, 81.0));
+        rust.functions.push(func("dup", 25, 95.0));
+        assert_round_trip(&rust, 73.21, &crap);
+
+        let empty = rust_metrics::RustMetrics::default();
+        for i in 0..=2_000 {
+            assert_round_trip(&empty, f64::from(i) * 0.0497, &[]);
+        }
     }
 }

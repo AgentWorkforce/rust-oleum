@@ -43,17 +43,54 @@ impl Report {
     }
 }
 
+/// A per-item metric value that can be ratcheted against a baseline ceiling.
+pub trait Ratchet: PartialOrd + Copy + std::fmt::Display {
+    /// Whether `self` sits measurably below `ceiling`, i.e. the ceiling is
+    /// looser than it needs to be.
+    fn below(self, ceiling: Self) -> bool;
+}
+
+impl Ratchet for u32 {
+    fn below(self, ceiling: Self) -> bool {
+        self < ceiling
+    }
+}
+
+impl Ratchet for usize {
+    fn below(self, ceiling: Self) -> bool {
+        self < ceiling
+    }
+}
+
+impl Ratchet for Rounded {
+    /// Floats compare in displayed tenths, with one tenth of slack: the
+    /// baseline writer stores `measured + 0.1`, which must not read as stale.
+    fn below(self, ceiling: Self) -> bool {
+        tenths(self.0) + 1 < tenths(ceiling.0)
+    }
+}
+
+/// A float expressed in whole tenths (the one-decimal display precision).
+pub fn tenths(x: f64) -> i64 {
+    (x * 10.0).round() as i64
+}
+
 /// Worst offenders over a per-item limit, honoring baseline allowances.
+/// Baseline entries that are looser than the measurement, no longer needed,
+/// or that match no measured item are violations too: the baseline is a
+/// ratchet. `noun` names the item kind ("function", "file").
 /// Returns (worst value, count over target).
-fn check_items<V: PartialOrd + Copy + std::fmt::Display>(
+fn check_items<V: Ratchet>(
     items: impl Iterator<Item = (String, V)>,
     target: V,
     baseline: &BTreeMap<String, V>,
-    metric: &str,
+    (metric, noun): (&str, &str),
     violations: &mut Vec<String>,
 ) -> (Option<(String, V)>, usize) {
     let mut worst: Option<(String, V)> = None;
     let mut over_target = 0;
+    // Baselined keys -> highest measured value under that key.
+    let mut matched: BTreeMap<String, V> = BTreeMap::new();
     for (key, value) in items {
         if worst.as_ref().is_none_or(|(_, w)| value > *w) {
             worst = Some((key.clone(), value));
@@ -70,8 +107,42 @@ fn check_items<V: PartialOrd + Copy + std::fmt::Display>(
                 )),
             }
         }
+        if baseline.contains_key(&key) {
+            let slot = matched.entry(key).or_insert(value);
+            if value > *slot {
+                *slot = value;
+            }
+        }
     }
+    stale_entries(target, baseline, &matched, (metric, noun), violations);
     (worst, over_target)
+}
+
+/// Flag baseline entries that no longer pin a measured value exactly.
+fn stale_entries<V: Ratchet>(
+    target: V,
+    baseline: &BTreeMap<String, V>,
+    matched: &BTreeMap<String, V>,
+    (metric, noun): (&str, &str),
+    violations: &mut Vec<String>,
+) {
+    for (key, allowed) in baseline {
+        let msg = match matched.get(key) {
+            None => format!(
+                "{metric}: baseline entry {key} matches no {noun}; remove it (or run --tighten)"
+            ),
+            Some(v) if *v <= target => format!(
+                "{metric}: {key} = {v} now meets the target {target}; \
+                 remove its baseline entry (or run --tighten)"
+            ),
+            Some(v) if v.below(*allowed) => format!(
+                "{metric}: {key} = {v} is below its grandfathered ceiling {allowed}; \
+                 tighten the baseline to {v} (or run --tighten)"
+            ),
+            Some(_) => continue,
+        };
+        violations.push(msg);
+    }
 }
 
 pub fn build(
@@ -92,15 +163,15 @@ pub fn build(
 }
 
 /// Add a per-item metric row (worst value + violation accounting).
-fn item_metric_row<V: PartialOrd + Copy + std::fmt::Display>(
+fn item_metric_row<V: Ratchet>(
     report: &mut Report,
-    key: &str,
+    (key, noun): (&str, &str),
     label: &str,
     items: impl Iterator<Item = (String, V)>,
     target: V,
     baseline: &BTreeMap<String, V>,
 ) {
-    let (worst, over) = check_items(items, target, baseline, key, &mut report.violations);
+    let (worst, over) = check_items(items, target, baseline, (key, noun), &mut report.violations);
     let worst_s = worst.map(|(k, v)| (k, v.to_string()));
     let detail = match &worst_s {
         Some((k, v)) => format!("{over} over target; worst: {k} = {v}"),
@@ -124,7 +195,7 @@ fn source_rows(config: &Config, rust: &RustMetrics, report: &mut Report) {
     let b = &config.baseline;
     item_metric_row(
         report,
-        "cyclomatic",
+        ("cyclomatic", "function"),
         "Cyclomatic complexity (per fn)",
         rust.functions
             .iter()
@@ -134,7 +205,7 @@ fn source_rows(config: &Config, rust: &RustMetrics, report: &mut Report) {
     );
     item_metric_row(
         report,
-        "cognitive",
+        ("cognitive", "function"),
         "Cognitive complexity (per fn)",
         rust.functions
             .iter()
@@ -144,7 +215,7 @@ fn source_rows(config: &Config, rust: &RustMetrics, report: &mut Report) {
     );
     item_metric_row(
         report,
-        "halstead",
+        ("halstead", "function"),
         "Halstead difficulty (per fn)",
         rust.functions.iter().map(|f| {
             (
@@ -160,7 +231,7 @@ fn source_rows(config: &Config, rust: &RustMetrics, report: &mut Report) {
     );
     item_metric_row(
         report,
-        "file_loc",
+        ("file_loc", "file"),
         "Lines of code per file",
         rust.files.iter().map(|f| (f.file.clone(), f.loc)),
         t.file_loc_max,
@@ -187,6 +258,11 @@ fn coverage_row(config: &Config, coverage_pct: Option<f64>, report: &mut Report)
             "coverage: {pct:.2}% is below the enforced floor {floor:.2}%"
         ));
     }
+    if let Some(msg) =
+        stale_coverage_floor(pct, t.coverage_min_pct, config.baseline.coverage_min_pct)
+    {
+        report.violations.push(msg);
+    }
     report.push_row(
         "coverage",
         MetricRow {
@@ -198,6 +274,28 @@ fn coverage_row(config: &Config, coverage_pct: Option<f64>, report: &mut Report)
             detail: format!("enforced floor: {floor:.2}%"),
         },
     );
+}
+
+/// Headroom the baseline writer leaves under measured coverage (floor =
+/// measured - 0.5), plus half a tenth for its one-decimal rounding.
+pub const COVERAGE_SLACK_PCT: f64 = 0.55;
+
+/// A grandfathered coverage floor that has fallen behind the measurement.
+fn stale_coverage_floor(pct: f64, target: f64, floor: Option<f64>) -> Option<String> {
+    let floor = floor?;
+    if pct >= target {
+        return Some(format!(
+            "coverage: {pct:.2}% now meets the target {target}%; \
+             remove the baseline coverage_min_pct (or run --tighten)"
+        ));
+    }
+    (pct - floor > COVERAGE_SLACK_PCT + 1e-9).then(|| {
+        format!(
+            "coverage: {pct:.2}% is more than 0.5 points above the enforced floor {floor:.2}%; \
+             raise the floor to {:.1} (or run --tighten)",
+            (pct - 0.5).max(0.0)
+        )
+    })
 }
 
 fn crap_row(config: &Config, crap: Option<&[CrapScore]>, report: &mut Report) {
@@ -212,7 +310,7 @@ fn crap_row(config: &Config, crap: Option<&[CrapScore]>, report: &mut Report) {
     };
     item_metric_row(
         report,
-        "crap",
+        ("crap", "function"),
         "CRAP score (per fn)",
         scores
             .iter()
@@ -358,7 +456,7 @@ mod tests {
     #[test]
     fn baseline_allows_grandfathered_violation() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("a.rs::big".to_string(), 30u32);
+        baseline.insert("a.rs::big".to_string(), 28u32);
         let mut violations = Vec::new();
         let items = vec![
             ("a.rs::big".to_string(), 28u32),
@@ -368,7 +466,7 @@ mod tests {
             items.into_iter(),
             22,
             &baseline,
-            "cyclomatic",
+            ("cyclomatic", "function"),
             &mut violations,
         );
         assert_eq!(over, 1);
@@ -384,7 +482,7 @@ mod tests {
             items.into_iter(),
             22,
             &BTreeMap::new(),
-            "cyclomatic",
+            ("cyclomatic", "function"),
             &mut violations,
         );
         assert_eq!(violations.len(), 1);
@@ -401,7 +499,7 @@ mod tests {
             items.into_iter(),
             22,
             &baseline,
-            "cyclomatic",
+            ("cyclomatic", "function"),
             &mut violations,
         );
         assert_eq!(violations.len(), 1);
@@ -539,7 +637,8 @@ mod tests {
 
     #[test]
     fn clean_inputs_pass_the_gate() {
-        let config = test_config();
+        let mut config = test_config();
+        config.baseline = Baseline::default();
         let rust = RustMetrics {
             files: vec![FileMetrics {
                 file: "ok.rs".into(),
@@ -557,6 +656,7 @@ mod tests {
             .unwrap();
         assert!(cov.meets_target);
         // Coverage below the floor is a violation.
+        config.baseline.coverage_min_pct = Some(80.0);
         let report = build(&config, &rust, Some(79.9), None, None, None);
         assert!(!report.gate_passed());
         assert!(report.violations[0].contains("below the enforced floor"));
@@ -575,7 +675,7 @@ mod tests {
             items.into_iter(),
             22,
             &BTreeMap::new(),
-            "m",
+            ("m", "function"),
             &mut violations,
         );
         assert_eq!(worst.unwrap(), ("b".to_string(), 5));
@@ -585,6 +685,7 @@ mod tests {
     fn coverage_exactly_at_floor_passes() {
         let mut config = test_config();
         config.baseline.coverage_min_pct = Some(80.0);
+        config.baseline.file_loc.clear();
         let rust = RustMetrics::default();
         let report = build(&config, &rust, Some(80.0), None, None, None);
         assert!(report.gate_passed());
@@ -600,7 +701,8 @@ mod tests {
 
     #[test]
     fn each_scalar_metric_violates_above_its_max() {
-        let config = test_config();
+        let mut config = test_config();
+        config.baseline.file_loc.clear();
         let rust = RustMetrics::default();
         let lints = LintCounts {
             dead_code: 1,
@@ -653,7 +755,7 @@ mod tests {
             vec![("a.rs::big".to_string(), 30u32)].into_iter(),
             22,
             &baseline,
-            "cyclomatic",
+            ("cyclomatic", "function"),
             &mut violations,
         );
         assert!(violations.is_empty());
@@ -666,7 +768,7 @@ mod tests {
             vec![("a.rs::f".to_string(), 22u32)].into_iter(),
             22,
             &BTreeMap::new(),
-            "cyclomatic",
+            ("cyclomatic", "function"),
             &mut violations,
         );
         assert!(violations.is_empty());
@@ -692,5 +794,171 @@ mod tests {
             },
         );
         assert!(!report.rows[0].passes_gate);
+    }
+
+    fn check_cyclomatic(baseline: &[(&str, u32)], items: &[(&str, u32)]) -> Vec<String> {
+        let baseline = baseline.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let mut violations = Vec::new();
+        check_items(
+            items.iter().map(|(k, v)| (k.to_string(), *v)),
+            22,
+            &baseline,
+            ("cyclomatic", "function"),
+            &mut violations,
+        );
+        violations
+    }
+
+    #[test]
+    fn loose_ceiling_fails_the_gate() {
+        let v = check_cyclomatic(&[("src/x.rs::f", 99)], &[("src/x.rs::f", 30)]);
+        assert_eq!(
+            v,
+            vec![
+                "cyclomatic: src/x.rs::f = 30 is below its grandfathered ceiling 99; \
+                 tighten the baseline to 30 (or run --tighten)"
+            ]
+        );
+    }
+
+    #[test]
+    fn entry_meeting_the_target_must_be_removed() {
+        let v = check_cyclomatic(&[("src/x.rs::f", 99)], &[("src/x.rs::f", 4)]);
+        assert_eq!(
+            v,
+            vec![
+                "cyclomatic: src/x.rs::f = 4 now meets the target 22; \
+                 remove its baseline entry (or run --tighten)"
+            ]
+        );
+        // Exactly at the target counts as meeting it.
+        let v = check_cyclomatic(&[("src/x.rs::f", 30)], &[("src/x.rs::f", 22)]);
+        assert!(v[0].contains("now meets the target"));
+    }
+
+    #[test]
+    fn unmatched_entry_fails_the_gate() {
+        let v = check_cyclomatic(&[("src/x.rs::gone", 30)], &[("src/x.rs::f", 3)]);
+        assert_eq!(
+            v,
+            vec![
+                "cyclomatic: baseline entry src/x.rs::gone matches no function; \
+                 remove it (or run --tighten)"
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_compare_the_highest_value() {
+        // Two items sharing a key: the ceiling pins the worse one.
+        let items = [("src/x.rs::f", 30), ("src/x.rs::f", 3)];
+        assert!(check_cyclomatic(&[("src/x.rs::f", 30)], &items).is_empty());
+    }
+
+    #[test]
+    fn unmatched_file_entry_names_a_file() {
+        let mut config = test_config();
+        config.baseline.coverage_min_pct = None;
+        let report = build(&config, &RustMetrics::default(), None, None, None, None);
+        assert_eq!(
+            report.violations,
+            vec!["file_loc: baseline entry big.rs matches no file; remove it (or run --tighten)"]
+        );
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.metric.contains("Lines"))
+            .unwrap();
+        assert!(!row.passes_gate);
+    }
+
+    #[test]
+    fn unmeasured_metrics_skip_baseline_checks() {
+        let mut config = test_config();
+        config.baseline.file_loc.clear();
+        config.baseline.crap = BTreeMap::from([("a.rs::gone".to_string(), 99.0)]);
+        // No coverage input: neither the crap map nor the floor is checked.
+        let report = build(&config, &RustMetrics::default(), None, None, None, None);
+        assert!(report.gate_passed(), "{:?}", report.violations);
+        // With coverage measured the crap entry is unmatched.
+        let report = build(
+            &config,
+            &RustMetrics::default(),
+            Some(80.0),
+            Some(&[]),
+            None,
+            None,
+        );
+        assert_eq!(report.violations.len(), 1);
+        assert!(report.violations[0].starts_with("crap: baseline entry a.rs::gone"));
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.metric.contains("CRAP"))
+            .unwrap();
+        assert!(!row.passes_gate);
+    }
+
+    #[test]
+    fn float_ceilings_allow_one_tenth_of_slack() {
+        let r = |m: f64, c: f64| Rounded(m).below(Rounded(c));
+        // The baseline writer stores measured + 0.1: not stale.
+        assert!(!r(85.04, 85.1));
+        assert!(!r(85.06, 85.2));
+        assert!(!r(85.0, 85.0));
+        // Two tenths of headroom is loose.
+        assert!(r(85.0, 85.2));
+        assert!(r(4.0, 99.0));
+        assert!(1u32.below(2) && !2usize.below(2));
+
+        let mut config = test_config();
+        config.baseline.file_loc.clear();
+        config.baseline.halstead = BTreeMap::from([("a.rs::f".to_string(), 90.0)]);
+        let mut f = fn_metric("f", 1);
+        f.halstead_difficulty = 60.0;
+        let rust = RustMetrics {
+            files: vec![],
+            functions: vec![f],
+        };
+        let report = build(&config, &rust, None, None, None, None);
+        assert_eq!(
+            report.violations,
+            vec![
+                "halstead: a.rs::f = 60.0 is below its grandfathered ceiling 90.0; \
+                 tighten the baseline to 60.0 (or run --tighten)"
+            ]
+        );
+    }
+
+    #[test]
+    fn coverage_floor_must_track_the_measurement() {
+        let mut config = test_config();
+        config.baseline.file_loc.clear();
+        config.baseline.coverage_min_pct = Some(80.0);
+        let rust = RustMetrics::default();
+        // Within half a point (plus rounding slack): passes.
+        assert!(build(&config, &rust, Some(80.5), None, None, None).gate_passed());
+        assert!(build(&config, &rust, Some(80.54), None, None, None).gate_passed());
+        // Well above: raise the floor.
+        let report = build(&config, &rust, Some(90.0), None, None, None);
+        assert_eq!(
+            report.violations,
+            vec![
+                "coverage: 90.00% is more than 0.5 points above the enforced floor 80.00%; \
+                 raise the floor to 89.5 (or run --tighten)"
+            ]
+        );
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.metric.contains("coverage"))
+            .unwrap();
+        assert!(!row.passes_gate);
+        // At the target: the floor is unnecessary.
+        let report = build(&config, &rust, Some(100.0), None, None, None);
+        assert!(report.violations[0].contains("now meets the target 100%"));
+        // No floor configured: nothing to be stale.
+        config.baseline.coverage_min_pct = None;
+        assert!(build(&config, &rust, Some(100.0), None, None, None).gate_passed());
     }
 }

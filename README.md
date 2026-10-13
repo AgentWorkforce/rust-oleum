@@ -23,8 +23,8 @@ rust-oleum        # the gate: exits non-zero on any NEW violation or regression
 ```
 
 That's it. Commit `rust-oleum.toml` and put `rust-oleum` in CI. Refactor a
-grandfathered offender under its target, delete its baseline line, and the
-ratchet tightens — it never loosens.
+grandfathered offender and the gate makes you lock the gain in (run
+`rust-oleum --tighten`): the ratchet tightens, and it never loosens.
 
 ## What it checks
 
@@ -76,10 +76,29 @@ cyclomatic_max = 22
 ```
 
 The gate fails on a violation that is not in the baseline, or that exceeds
-its grandfathered ceiling. `rust-oleum --write-baseline` regenerates the
-section after a refactor. The coverage floor works the same way: measured
+its grandfathered ceiling. The coverage floor works the same way: measured
 coverage may never drop below the baseline floor while you climb toward the
 target.
+
+The baseline must also stay tight, so improvements are locked in instead
+of leaving room to slide back. The gate fails when:
+
+- a ceiling is looser than the measured value (`parse_event` dropped from
+  45 to 30 but its entry still says 45). Float metrics (Halstead, CRAP)
+  compare at one decimal, with a tenth of slack;
+- a grandfathered item now meets its target, so the entry is unnecessary;
+- an entry matches no measured file or function (it was deleted or renamed);
+- measured coverage is more than half a point above the baseline floor, or
+  meets the target.
+
+Entries for metrics that weren't measured in a run (CRAP and coverage
+without `--coverage`) are left alone.
+
+`rust-oleum --tighten` fixes all of this in place: it rewrites the
+`[baseline]` section of `rust-oleum.toml` (everything above it is kept
+byte-for-byte), removing stale entries and lowering loose ceilings. It
+never grandfathers a regression or a new violation, so those still fail.
+`rust-oleum --write-baseline` prints a freshly regenerated section instead.
 
 ## License
 

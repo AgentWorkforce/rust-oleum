@@ -14,6 +14,7 @@ mod init;
 mod loc;
 mod report;
 mod rust_metrics;
+mod tighten;
 
 use std::path::PathBuf;
 
@@ -56,6 +57,13 @@ struct Args {
     /// violation of the targets, then exit 0 without gating.
     #[arg(long)]
     write_baseline: bool,
+
+    /// Rewrite the config's `[baseline]` in place so it only shrinks:
+    /// drop entries that now meet the target or match nothing, and lower
+    /// loose ceilings to today's values. Regressions and new violations are
+    /// never grandfathered. Exits 0 without gating.
+    #[arg(long, conflicts_with = "write_baseline")]
+    tighten: bool,
 
     /// Append a markdown summary to this path (e.g. $GITHUB_STEP_SUMMARY).
     #[arg(long)]
@@ -107,12 +115,13 @@ fn main() -> Result<()> {
         .map(external::parse_mutants_outcomes)
         .transpose()?;
 
-    if args.write_baseline {
-        print!(
-            "{}",
-            init::baseline_toml(&config, &rust, coverage_pct, crap.as_deref())
-        );
-        return Ok(());
+    if args.write_baseline || args.tighten {
+        let fresh = init::baseline(&config, &rust, coverage_pct, crap.as_deref());
+        let measured = tighten::Measured {
+            coverage: coverage_pct.is_some(),
+            crap: crap.is_some(),
+        };
+        return regenerate_baseline(&args, &repo_root, &config, &fresh, measured);
     }
 
     let report = report::build(
@@ -149,6 +158,29 @@ fn main() -> Result<()> {
     if !report.gate_passed() {
         std::process::exit(1);
     }
+    Ok(())
+}
+
+/// `--write-baseline` prints the regenerated section; `--tighten` rewrites
+/// the config so the baseline only shrinks.
+fn regenerate_baseline(
+    args: &Args,
+    repo_root: &std::path::Path,
+    config: &config::Config,
+    fresh: &config::Baseline,
+    measured: tighten::Measured,
+) -> Result<()> {
+    if args.write_baseline {
+        print!("{}", init::render_baseline(fresh));
+        return Ok(());
+    }
+    let summary = tighten::run(
+        &repo_root.join(&args.config),
+        &config.baseline,
+        fresh,
+        measured,
+    )?;
+    println!("{summary}");
     Ok(())
 }
 
