@@ -123,7 +123,7 @@ of leaving room to slide back. The gate fails when:
   compare at one decimal, with a tenth of slack;
 - a grandfathered item now meets its target, so the entry is unnecessary;
 - an entry matches no measured file or function (it was deleted or renamed);
-- measured coverage is more than half a point above the baseline floor, or
+- measured coverage is more than a point above the baseline floor, or
   meets the target.
 
 Entries for metrics that weren't measured in a run (CRAP and coverage

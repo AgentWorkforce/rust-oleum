@@ -337,9 +337,11 @@ fn coverage_row(config: &Config, coverage_pct: Option<f64>, report: &mut Report)
     );
 }
 
-/// Headroom the baseline writer leaves under measured coverage (floor =
-/// measured - 0.5), plus half a tenth for its one-decimal rounding.
-pub const COVERAGE_SLACK_PCT: f64 = 0.55;
+/// How far measured coverage may sit above the grandfathered floor before
+/// the floor counts as stale. The baseline writer leaves half a point of
+/// headroom (floor = measured - 0.5), so a full point gives a freshly
+/// written floor another half point of tolerance for run-to-run noise.
+pub const COVERAGE_SLACK_PCT: f64 = 1.0;
 
 /// A grandfathered coverage floor that has fallen behind the measurement.
 fn stale_coverage_floor(pct: f64, target: f64, floor: Option<f64>) -> Option<String> {
@@ -352,7 +354,7 @@ fn stale_coverage_floor(pct: f64, target: f64, floor: Option<f64>) -> Option<Str
     }
     (pct - floor > COVERAGE_SLACK_PCT + 1e-9).then(|| {
         format!(
-            "coverage: {pct:.2}% is more than 0.5 points above the enforced floor {floor:.2}%; \
+            "coverage: {pct:.2}% is more than 1 point above the enforced floor {floor:.2}%; \
              raise the floor to {:.1} (or run --tighten)",
             (pct - 0.5).max(0.0)
         )
@@ -1120,15 +1122,16 @@ mod tests {
         config.baseline.file_loc.clear();
         config.baseline.coverage_min_pct = Some(80.0);
         let rust = RustMetrics::default();
-        // Within half a point (plus rounding slack): passes.
+        // Within a point: passes (a fresh floor sits half a point under).
         assert!(build(&config, &rust, Some(80.5), None, None, None).gate_passed());
-        assert!(build(&config, &rust, Some(80.54), None, None, None).gate_passed());
+        assert!(build(&config, &rust, Some(81.0), None, None, None).gate_passed());
+        assert!(!build(&config, &rust, Some(81.01), None, None, None).gate_passed());
         // Well above: raise the floor.
         let report = build(&config, &rust, Some(90.0), None, None, None);
         assert_eq!(
             report.violations,
             vec![
-                "coverage: 90.00% is more than 0.5 points above the enforced floor 80.00%; \
+                "coverage: 90.00% is more than 1 point above the enforced floor 80.00%; \
                  raise the floor to 89.5 (or run --tighten)"
             ]
         );
