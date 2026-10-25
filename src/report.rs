@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use crate::config::{function_key, Config};
 use crate::coverage::CrapScore;
 use crate::external::{LintCounts, MutantCounts};
+use crate::hints::{self, Hint};
 use crate::rust_metrics::{FunctionMetrics, RustMetrics};
 
 #[derive(Debug, serde::Serialize)]
@@ -25,6 +26,8 @@ pub struct MetricRow {
 pub struct Report {
     pub rows: Vec<MetricRow>,
     pub violations: Vec<String>,
+    /// One fix hint per violated metric (see `hints`).
+    pub hints: Vec<Hint>,
 }
 
 impl Report {
@@ -165,6 +168,7 @@ pub fn build(
     crap_row(config, crap, &mut report);
     mutants_row(config, mutants, &mut report);
     lint_rows(config, lints, &mut report);
+    report.hints = hints::for_violations(&report.violations);
     report
 }
 

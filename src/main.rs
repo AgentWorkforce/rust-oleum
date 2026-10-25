@@ -11,6 +11,7 @@ mod complexity;
 mod config;
 mod coverage;
 mod external;
+mod hints;
 mod init;
 mod loc;
 mod report;
@@ -168,6 +169,7 @@ fn main() -> Result<()> {
         for v in &report.violations {
             eprintln!("  - {v}");
         }
+        eprint!("{}", hints::render_text(&report.hints));
     }
 
     if let Some(path) = &args.json {
@@ -225,6 +227,7 @@ fn write_github_summary(path: &std::path::Path, report: &report::Report) -> Resu
         for v in &report.violations {
             md.push_str(&format!("- {v}\n"));
         }
+        md.push_str(&hints::render_markdown(&report.hints));
     }
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
