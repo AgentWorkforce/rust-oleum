@@ -94,8 +94,33 @@ pub fn clamp(old: &Baseline, fresh: &Baseline, measured: Measured) -> (Baseline,
         } else {
             old.redundant_code.clone()
         },
+        lint_groups: if measured.lints {
+            clamp_groups(&old.lint_groups, &fresh.lint_groups, &mut s)
+        } else {
+            old.lint_groups.clone()
+        },
     };
     (tight, s)
+}
+
+type Groups = BTreeMap<String, BTreeMap<String, usize>>;
+
+/// Clamp each lint group's entries; groups left empty are dropped.
+fn clamp_groups(old: &Groups, fresh: &Groups, s: &mut Summary) -> Groups {
+    let empty = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    for name in old.keys().chain(fresh.keys()) {
+        if out.contains_key(name) {
+            continue;
+        }
+        let o = old.get(name).unwrap_or(&empty);
+        out.insert(
+            name.clone(),
+            clamp_map(o, fresh.get(name).unwrap_or(&empty), s),
+        );
+    }
+    out.retain(|_, entries| !entries.is_empty());
+    out
 }
 
 fn clamp_floor(old: Option<f64>, fresh: Option<f64>, s: &mut Summary) -> Option<f64> {
@@ -317,6 +342,58 @@ mod tests {
         let mut raised = same.clone();
         raised.coverage_min_pct = Some(71.0);
         assert_eq!(clamp(&same, &raised, ALL).1.lowered, 1);
+    }
+
+    fn groups(entries: &[(&str, &str, usize)]) -> Baseline {
+        let mut b = Baseline::default();
+        for (group, key, n) in entries {
+            b.lint_groups
+                .entry(group.to_string())
+                .or_default()
+                .insert(key.to_string(), *n);
+        }
+        b
+    }
+
+    #[test]
+    fn clamp_tightens_lint_groups() {
+        let old = groups(&[
+            ("panics", "u@a::f", 3),
+            ("panics", "u@a::gone", 1),
+            ("docs", "d@a::g", 1),
+        ]);
+        let fresh = groups(&[
+            ("panics", "u@a::f", 2),
+            ("docs", "d@a::g", 2),
+            ("casts", "c@a::h", 1),
+        ]);
+        let (tight, s) = clamp(&old, &fresh, ALL);
+        assert_eq!(
+            tight,
+            groups(&[("panics", "u@a::f", 2), ("docs", "d@a::g", 1)])
+        );
+        // gone removed; f lowered; g regressed and casts is new: refused.
+        assert_eq!(
+            s,
+            Summary {
+                removed: 1,
+                lowered: 1,
+                refused: 2
+            }
+        );
+        // A group whose every entry is fixed disappears.
+        let (tight, s) = clamp(&old, &groups(&[("panics", "u@a::f", 3)]), ALL);
+        assert_eq!(tight, groups(&[("panics", "u@a::f", 3)]));
+        assert_eq!(s.removed, 2);
+        // Without a clippy log the groups are left alone.
+        let none = Measured {
+            coverage: true,
+            crap: true,
+            lints: false,
+        };
+        let (tight, s) = clamp(&old, &Baseline::default(), none);
+        assert_eq!(tight, old);
+        assert_eq!(s, Summary::default());
     }
 
     #[test]

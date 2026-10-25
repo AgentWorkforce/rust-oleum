@@ -441,6 +441,13 @@ fn lint_rows(config: &Config, lints: Option<&LintCounts>, report: &mut Report) {
                 "needs --clippy-log",
             ));
         }
+        for (name, group) in &config.lint_groups {
+            report.rows.push(not_measured(
+                &group_label(name),
+                &format!("<= {}/item", group.max),
+                "needs --clippy-log",
+            ));
+        }
         return;
     };
     lint_row(
@@ -459,6 +466,31 @@ fn lint_rows(config: &Config, lints: Option<&LintCounts>, report: &mut Report) {
         t.redundant_code_max,
         &b.redundant_code,
     );
+    let empty = BTreeMap::new();
+    for (name, group) in &config.lint_groups {
+        let (items, total) = l
+            .groups
+            .get(name)
+            .map_or((&empty, 0), |g| (&g.items, g.total));
+        lint_row(
+            report,
+            &group_key(name),
+            &group_label(name),
+            (items, total),
+            group.max,
+            b.lint_groups.get(name).unwrap_or(&empty),
+        );
+    }
+}
+
+/// Violation prefix for a configured lint group (namespaced so a group
+/// name can never collide with a built-in metric key).
+fn group_key(name: &str) -> String {
+    format!("lints.{name}")
+}
+
+fn group_label(name: &str) -> String {
+    format!("Lint group: {name}")
 }
 
 /// Per-item lint row: items (`lint@file::fn` -> count) are gated like
@@ -609,6 +641,7 @@ mod tests {
                 redundant_code_max: 0,
                 ..Targets::default()
             },
+            lint_groups: BTreeMap::new(),
             baseline: Baseline {
                 coverage_min_pct: Some(80.0),
                 file_loc: BTreeMap::from([("big.rs".to_string(), 150)]),
@@ -929,6 +962,108 @@ mod tests {
             .find(|r| r.metric == "Dead code findings")
             .unwrap();
         assert!(!row.passes_gate);
+    }
+
+    fn group_config() -> Config {
+        let mut config = test_config();
+        config.baseline.file_loc.clear();
+        config.baseline.coverage_min_pct = None;
+        for (name, max) in [("panics", 0), ("docs", 1)] {
+            let group = crate::config::LintGroup {
+                lints: vec![format!("lint_{name}")],
+                max,
+            };
+            config.lint_groups.insert(name.into(), group);
+        }
+        config.baseline.lint_groups.insert(
+            "panics".into(),
+            BTreeMap::from([("u@a.rs::old".to_string(), 2)]),
+        );
+        config
+    }
+
+    fn group_lints(entries: &[(&str, &str, usize)]) -> LintCounts {
+        let mut lints = LintCounts::default();
+        for (group, key, n) in entries {
+            let g = lints.groups.entry(group.to_string()).or_default();
+            g.total += n;
+            g.items.insert(key.to_string(), *n);
+        }
+        lints
+    }
+
+    #[test]
+    fn lint_group_rows_gate_per_item_with_their_own_max() {
+        let config = group_config();
+        let rust = RustMetrics::default();
+        let gate = |l: &LintCounts| build(&config, &rust, None, None, Some(l), None);
+
+        // Grandfathered at its ceiling, and within the docs group's max of 1.
+        let report = gate(&group_lints(&[
+            ("panics", "u@a.rs::old", 2),
+            ("docs", "d@a.rs::f", 1),
+        ]));
+        assert!(report.gate_passed(), "{:?}", report.violations);
+        let row = |r: &Report, m: &str| {
+            let row = r.rows.iter().find(|x| x.metric == m).unwrap();
+            (
+                row.value.clone(),
+                row.target.clone(),
+                row.meets_target,
+                row.passes_gate,
+            )
+        };
+        assert_eq!(
+            row(&report, "Lint group: panics"),
+            ("2".into(), "<= 0/item".into(), false, true)
+        );
+        assert_eq!(
+            row(&report, "Lint group: docs"),
+            ("1".into(), "<= 1/item".into(), true, true)
+        );
+        assert_eq!(report.rows.len(), 15);
+
+        // Over the docs max, a new panics item, and the old one now fixed.
+        let report = gate(&group_lints(&[
+            ("panics", "u@a.rs::new", 1),
+            ("docs", "d@a.rs::f", 2),
+        ]));
+        assert_eq!(
+            report.violations,
+            vec![
+                "lints.docs: d@a.rs::f = 2 exceeds target 1 (new violation)",
+                "lints.panics: u@a.rs::new = 1 exceeds target 0 (new violation)",
+                "lints.panics: baseline entry u@a.rs::old matches no finding; \
+                 remove it (or run --tighten)",
+            ]
+        );
+        assert!(!row(&report, "Lint group: panics").3);
+        assert!(!row(&report, "Lint group: docs").3);
+
+        // A group with no findings at all still checks its baseline.
+        let report = gate(&LintCounts::default());
+        assert_eq!(report.violations.len(), 1, "{:?}", report.violations);
+        assert!(report.violations[0].starts_with("lints.panics: baseline entry"));
+        assert_eq!(
+            row(&report, "Lint group: docs"),
+            ("0".into(), "<= 1/item".into(), true, true)
+        );
+    }
+
+    #[test]
+    fn lint_group_rows_are_not_measured_without_a_log() {
+        let config = group_config();
+        let report = build(&config, &RustMetrics::default(), None, None, None, None);
+        assert!(report.gate_passed(), "{:?}", report.violations);
+        let docs = report
+            .rows
+            .iter()
+            .find(|r| r.metric == "Lint group: docs")
+            .unwrap();
+        assert_eq!(docs.value, "not measured");
+        assert_eq!(docs.target, "<= 1/item");
+        assert_eq!(docs.detail, "needs --clippy-log");
+        assert_eq!(report.rows.len(), 15);
     }
 
     #[test]
