@@ -371,3 +371,154 @@ fn custom_config_path_and_missing_config_error() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("reading config"), "{}", stderr(&out));
 }
+
+/// One clippy `compiler-message` line for `code` at `src/lib.rs:line`.
+fn diag(code: &str, line: usize) -> String {
+    format!(
+        r#"{{"reason":"compiler-message","message":{{"code":{{"code":"{code}"}},"message":"m","spans":[{{"file_name":"src/lib.rs","line_start":{line},"column_start":1,"is_primary":true}}]}}}}"#
+    ) + "\n"
+}
+
+#[test]
+fn init_with_preset_ratchets_lint_groups_end_to_end() {
+    let fx = Fixture::new();
+    let log = fx.write(
+        "clippy.json",
+        &(diag("clippy::unwrap_used", 1) + &diag("missing_docs", 2) + &diag("clippy::ptr_arg", 2)),
+    );
+    let log = log.to_str().unwrap();
+    let out = fx.run(&["init", "--preset", "beautiful-rust", "--clippy-log", log]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("cargo clippy --all-targets --message-format=json -- -W clippy::unwrap_used"),
+        "{text}"
+    );
+    assert!(text.contains("max-fn-params-bools = 0"), "{text}");
+    let config = fx.read("rust-oleum.toml");
+    assert!(config.contains("[lint_groups.unsafe_hygiene]"), "{config}");
+    assert!(
+        config.contains(
+            "[baseline.lint_groups.panics]\n\"clippy::unwrap_used@src/lib.rs::tidy\" = 1\n"
+        ),
+        "{config}"
+    );
+    assert!(
+        config.contains("[baseline.lint_groups.api]\n\"clippy::ptr_arg@src/lib.rs::knotty\" = 1\n"),
+        "{config}"
+    );
+
+    // The written config passes with the same log, and the summary shows
+    // one row per group.
+    let summary = fx.root().join("summary.md");
+    let summary_arg = summary.to_str().unwrap();
+    let gate = fx.run(&["--clippy-log", log, "--github-summary", summary_arg]);
+    assert!(gate.status.success(), "{}", stderr(&gate));
+    assert!(stdout(&gate).contains("Lint group: panics"));
+    let md = fx.read("summary.md");
+    assert!(
+        md.contains("| Lint group: docs | 1 | <= 0/item | ⚠️ | ✅ |"),
+        "{md}"
+    );
+    assert!(
+        md.contains("| Lint group: casts | 0 | <= 0/item | ✅ | ✅ |"),
+        "{md}"
+    );
+
+    // A new finding in a group fails; a fixed one leaves a stale entry.
+    let worse = fx.write(
+        "worse.json",
+        &(diag("clippy::unwrap_used", 1)
+            + &diag("clippy::dbg_macro", 3)
+            + &diag("clippy::ptr_arg", 2)),
+    );
+    let worse = worse.to_str().unwrap();
+    let out = fx.run(&["--clippy-log", worse]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("lints.leftovers: clippy::dbg_macro@src/lib.rs::knotty = 1 exceeds target 0 (new violation)"),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "lints.docs: baseline entry missing_docs@src/lib.rs::knotty matches no finding"
+        ),
+        "{err}"
+    );
+
+    // --tighten drops the fixed entry but never grandfathers the new one.
+    let out = fx.run(&["--tighten", "--clippy-log", worse]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("1 entries removed, 0 lowered; 1 new"),
+        "{}",
+        stdout(&out)
+    );
+    let config = fx.read("rust-oleum.toml");
+    assert!(!config.contains("[baseline.lint_groups.docs]"), "{config}");
+    assert!(!config.contains("dbg_macro@"), "{config}");
+    assert!(config.contains("[lint_groups.docs]"), "{config}");
+    assert_eq!(fx.run(&["--clippy-log", worse]).status.code(), Some(1));
+    let clean = fx.write(
+        "clean.json",
+        &(diag("clippy::unwrap_used", 1) + &diag("clippy::ptr_arg", 2)),
+    );
+    let out = fx.run(&["--clippy-log", clean.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn custom_lint_groups_match_prefixes_and_reject_overlaps() {
+    let fx = Fixture::new();
+    let base = "[targets]\n\n[lint_groups.style]\nlints = [\"clippy::needless_*\"]\nmax = 1\n\n";
+    fx.write(
+        "rust-oleum.toml",
+        &format!("{base}[sources]\nrust_roots = [\"src\"]\n"),
+    );
+    // Two findings in `knotty` exceed the per-item max of 1; the group
+    // claims them from the built-in redundant-code group.
+    let log = fx.write(
+        "clippy.json",
+        &(diag("clippy::needless_return", 3)
+            + &diag("clippy::needless_return", 4)
+            + &diag("clippy::needless_bool", 3)
+            + &diag("clippy::needless_return", 1)),
+    );
+    let out = fx.run(&["--clippy-log", log.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains(
+            "lints.style: clippy::needless_return@src/lib.rs::knotty = 2 exceeds target 1"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("redundant code:"), "{err}");
+    assert!(!err.contains("needless_bool"), "{err}");
+    assert!(!err.contains("::tidy"), "{err}");
+    // Without a log the group's row is reported as not measured.
+    let out = fx.run(&[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("Lint group: style"));
+
+    fx.write(
+        "rust-oleum.toml",
+        &format!(
+            "{base}[lint_groups.other]\nlints = [\"clippy::needless_bool\"]\n\n[sources]\nrust_roots = [\"src\"]\n"
+        ),
+    );
+    let out = fx.run(&[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(
+            "`clippy::needless_*` in [lint_groups.style] overlaps `clippy::needless_bool`"
+        ),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = fx.run(&["init", "--force", "--preset", "nope"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("beautiful-rust"), "{}", stderr(&out));
+}

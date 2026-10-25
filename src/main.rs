@@ -2,8 +2,8 @@
 //!
 //! Measures a codebase against the targets in `rust-oleum.toml` (complexity,
 //! Halstead difficulty, file size, unsafe/panic/lint-suppression counts,
-//! coverage, CRAP, mutants, dead/redundant code) and exits non-zero when
-//! the enforced gate fails.
+//! coverage, CRAP, mutants, dead/redundant code, configured lint groups)
+//! and exits non-zero when the enforced gate fails.
 //! Existing violations are grandfathered in a `[baseline]` section that may
 //! only shrink: new violations and regressions fail, today's debt doesn't.
 
@@ -13,6 +13,7 @@ mod coverage;
 mod external;
 mod init;
 mod loc;
+mod presets;
 mod report;
 mod rust_metrics;
 mod rust_safety;
@@ -42,7 +43,7 @@ struct Args {
     coverage: Option<PathBuf>,
 
     /// JSON log from `cargo clippy --message-format=json` (enables per-item
-    /// dead / redundant code findings).
+    /// dead / redundant code and `[lint_groups]` findings).
     #[arg(long)]
     clippy_log: Option<PathBuf>,
 
@@ -85,6 +86,10 @@ enum Command {
         /// baseline grandfathers today's dead / redundant code findings.
         #[arg(long)]
         clippy_log: Option<PathBuf>,
+        /// Add a preset's `[lint_groups]` (and print the clippy flags that
+        /// enable its lints).
+        #[arg(long, value_enum)]
+        preset: Option<presets::Preset>,
         /// Overwrite an existing config file.
         #[arg(long)]
         force: bool,
@@ -98,6 +103,7 @@ fn main() -> Result<()> {
     if let Some(Command::Init {
         coverage,
         clippy_log,
+        preset,
         force,
     }) = args.command
     {
@@ -105,6 +111,7 @@ fn main() -> Result<()> {
             &repo_root,
             coverage.as_deref(),
             clippy_log.as_deref(),
+            preset,
             force,
         );
     }
@@ -123,7 +130,7 @@ fn main() -> Result<()> {
     let lints = args
         .clippy_log
         .as_deref()
-        .map(|p| external::parse_clippy_log(p, &repo_root, &rust.functions))
+        .map(|p| external::parse_clippy_log(p, &repo_root, &rust.functions, &config))
         .transpose()?;
     let mutants = args
         .mutants
