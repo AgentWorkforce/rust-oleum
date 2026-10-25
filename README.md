@@ -76,7 +76,7 @@ comes from where there is one:
 
 ```text
 how to fix:
-  - panic: return an error with `?`, or use `expect("why this cannot fail")`; don't hide the failure with `unwrap_or_default()` (BeautifulRust §5, Rust API Guidelines C-GOOD-ERR)
+  - panic: return an error with `?` or handle the `None`/`Err` case explicitly; `expect("why")` still counts, so keep one only as a reviewed baseline entry; don't hide the failure with `unwrap_or_default()` (BeautifulRust §5, Rust API Guidelines C-GOOD-ERR)
 ```
 
 Loose or stale baseline entries get one hint to run `rust-oleum --tighten`.

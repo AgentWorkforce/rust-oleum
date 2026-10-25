@@ -48,20 +48,22 @@ const HINTS: &[(&str, &str)] = &[
     ),
     (
         "panic",
-        "return an error with `?`, or use `expect(\"why this cannot fail\")`; \
-         don't hide the failure with `unwrap_or_default()` \
-         (BeautifulRust §5, Rust API Guidelines C-GOOD-ERR)",
+        "return an error with `?` or handle the `None`/`Err` case explicitly; `expect(\"why\")` \
+         still counts, so keep one only as a reviewed baseline entry; don't hide the failure \
+         with `unwrap_or_default()` (BeautifulRust §5, Rust API Guidelines C-GOOD-ERR)",
     ),
     (
         "allow",
-        "fix the lint; if it is truly wrong here use `#[expect(lint, reason = \"...\")]` on the \
-         narrowest item (BeautifulRust §2); don't hoist it to a module- or crate-level `#![allow]`",
+        "fix the lint; `#[expect(lint, reason = \"...\")]` still counts, so keep one only as a \
+         reviewed baseline entry on the narrowest item (BeautifulRust §2); don't hoist it to a \
+         module- or crate-level `#![allow]`",
     ),
     (
         "file_allow",
         "fix the lints and delete the attribute; set project-wide lint levels once in \
-         `Cargo.toml` `[lints]`, and use `#[expect(lint, reason = \"...\")]` on the one item \
-         that needs it (BeautifulRust §2); don't scatter `#[allow]` onto each fn instead",
+         `Cargo.toml` `[lints]`; an item-level `#[expect(lint, reason = \"...\")]` still counts, \
+         so keep one only as a reviewed baseline entry (BeautifulRust §2); \
+         don't scatter `#[allow]` onto each fn instead",
     ),
     (
         "coverage",
