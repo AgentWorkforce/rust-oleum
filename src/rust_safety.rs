@@ -185,21 +185,21 @@ fn is_blank_str(expr: &syn::Expr) -> bool {
 }
 
 /// Warning groups denied or forbidden by one attribute, looking inside
-/// `cfg_attr(pred, deny(..))` too.
+/// `cfg_attr(pred, deny(..))` too, however deeply nested.
 fn denied_warning_groups(attr: &syn::Attribute) -> u32 {
-    let metas: Vec<syn::Meta> = match list_args(attr, &["cfg_attr"]) {
-        // The first argument is the cfg predicate.
-        Some(Ok(args)) => args.into_iter().skip(1).collect(),
-        Some(Err(_)) => Vec::new(),
-        None => vec![attr.meta.clone()],
-    };
-    metas.iter().map(denied_in_meta).sum()
+    denied_in_meta(&attr.meta)
 }
 
 fn denied_in_meta(meta: &syn::Meta) -> u32 {
     let syn::Meta::List(list) = meta else {
         return 0;
     };
+    if list.path.is_ident("cfg_attr") {
+        // The first argument is the cfg predicate; the rest are attributes.
+        return list
+            .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+            .map_or(0, |args| args.iter().skip(1).map(denied_in_meta).sum());
+    }
     if !(list.path.is_ident("deny") || list.path.is_ident("forbid")) {
         return 0;
     }
@@ -665,6 +665,8 @@ mod tests {
             #![cfg_attr(ci, forbid(clippy::all, unsafe_code, reason = "ci"))]
         "#;
         assert_eq!(file_counts(reasoned).deny_warnings_count, 2);
+        let nested = "#![cfg_attr(unix, cfg_attr(debug_assertions, deny(warnings)))]";
+        assert_eq!(file_counts(nested).deny_warnings_count, 1);
     }
 
     #[test]

@@ -116,6 +116,10 @@ impl ErrorTypeScan {
     }
 
     fn define(&mut self, file: &str, ident: &syn::Ident, attrs: &[syn::Attribute]) {
+        // Test-only types never ship, so they can't be public API errors.
+        if crate::rust_metrics::is_cfg_test(attrs) {
+            return;
+        }
         let name = ident.to_string();
         if derives_error(attrs) {
             self.implemented.insert(name.clone());
@@ -225,7 +229,7 @@ impl<'ast> Visit<'ast> for ErrorVisitor<'_> {
     /// `pub type Result<T> = std::result::Result<T, MyError>;` exposes
     /// `MyError` as surely as a fn returning it.
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-        if is_pub(&node.vis) {
+        if is_pub(&node.vis) && !crate::rust_metrics::is_cfg_test(&node.attrs) {
             self.scan.returns(&node.ty);
         }
     }
@@ -405,7 +409,10 @@ mod tests {
              pub struct TestOnly;\n\
              #[cfg(test)] pub fn helper() -> Result<(), TestOnly> {}\n\
              #[test] pub fn case() -> Result<(), TestOnly> {}\n\
-             impl S { #[cfg(test)] pub fn h(&self) -> Result<(), TestOnly> {} }",
+             impl S { #[cfg(test)] pub fn h(&self) -> Result<(), TestOnly> {} }\n\
+             #[cfg(test)] pub struct TestErr;\n\
+             #[cfg(test)] pub type TestResult<T> = Result<T, TestErr>;\n\
+             #[cfg(test)] pub type Leaky<T> = Result<T, Other>;",
         )]);
         assert_eq!(found, BTreeMap::from([("src/p.rs::Other".to_string(), 1)]));
     }
