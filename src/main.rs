@@ -86,10 +86,10 @@ enum Command {
         /// baseline grandfathers today's dead / redundant code findings.
         #[arg(long)]
         clippy_log: Option<PathBuf>,
-        /// Add a preset's `[lint_groups]` (and print the clippy flags that
-        /// enable its lints).
-        #[arg(long, value_enum)]
-        preset: Option<presets::Preset>,
+        /// Lint groups to write (and print the clippy flags that enable
+        /// their lints); `none` opts out of the default groups.
+        #[arg(long, value_enum, default_value_t = presets::Preset::BeautifulRust)]
+        preset: presets::Preset,
         /// Overwrite an existing config file.
         #[arg(long)]
         force: bool,

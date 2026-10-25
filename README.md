@@ -69,9 +69,12 @@ grandfathers today's findings.
 
 ### Lint groups
 
-Dead and redundant code are two built-in groups; every other lint in the
-log is ignored unless you put it in a group of your own. Each group gets
-its own report row and is ratcheted per item exactly like dead code:
+Dead and redundant code are two built-in groups. On top of them,
+rust-oleum is opinionated: a config with no `[lint_groups]` section gets
+the [BeautifulRust groups](#default-lint-groups-beautifulrust) below. Any
+`[lint_groups]` table replaces them, so define your own groups, or write an
+empty `[lint_groups]` to opt out. Each group gets its own report row and is
+ratcheted per item exactly like dead code:
 
 ```toml
 [lint_groups.panics]
@@ -96,17 +99,21 @@ A lint only reaches the log if it is enabled, and many useful ones are
 allow-by-default: enable them in `Cargo.toml`'s `[lints]` table or with
 `-W` flags when producing the log.
 
-### Presets
+### Default lint groups: BeautifulRust
 
-`rust-oleum init --preset beautiful-rust` writes lint groups inspired by
-the machine-checkable rules of
+rust-oleum's opinion of good Rust is
+[BeautifulRust](https://github.com/morganlinton/BeautifulRust)'s. Its
+groups apply whenever a config declares none, and `rust-oleum init` writes
+them into the new config explicitly so they are easy to edit
+(`init --preset none` writes an empty `[lint_groups]` instead). They are
+inspired by the machine-checkable rules of
 [BeautifulRust](https://github.com/morganlinton/BeautifulRust) (MIT),
 pinned to its v1.2.0 lint list (commit `c9a062e`; see
-[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)). The preset uses only its
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)). They use only its
 individual lints: whole groups such as `clippy::pedantic` would flood the
-baseline. It also adds `clippy::ptr_arg`, which upstream gets from
+baseline. They also add `clippy::ptr_arg`, which upstream gets from
 `clippy::all`. A test checks that the installed clippy recognises every
-lint name in the preset.
+lint name in them.
 
 | Group | Lints |
 |---|---|
@@ -169,6 +176,12 @@ allow-print-in-tests = true
 ```
 
 The `--github-summary` flag renders the metric table on the workflow run page.
+
+**Enable the default lints.** Most lints in the default lint groups are off
+unless enabled, and a lint that never reaches the log reads as "no
+findings". Produce the log with the `-W` flags `init` prints (see
+[Default lint groups](#default-lint-groups-beautifulrust)), or enable them
+in `Cargo.toml`'s `[lints]` table.
 
 **Warm caches.** If cargo considers your crates up to date (e.g. a cached
 `target/`, or a prior `cargo check`), `cargo clippy` may lint nothing and
