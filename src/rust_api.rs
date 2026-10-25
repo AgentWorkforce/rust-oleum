@@ -231,12 +231,17 @@ impl<'ast> Visit<'ast> for ErrorVisitor<'_> {
     }
 
     // Signatures only: types and impls inside fn bodies aren't public API.
+    // Test-only fns (`#[test]`, `#[cfg(test)]`) aren't public API either.
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.scan.returns_from(&node.vis, &node.sig);
+        if !crate::rust_metrics::has_test_attr(&node.attrs) {
+            self.scan.returns_from(&node.vis, &node.sig);
+        }
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.scan.returns_from(&node.vis, &node.sig);
+        if !crate::rust_metrics::has_test_attr(&node.attrs) {
+            self.scan.returns_from(&node.vis, &node.sig);
+        }
     }
 }
 
@@ -396,7 +401,11 @@ mod tests {
              pub fn unit() {}\n\
              impl S { pub fn m(&self) -> Result<(), Other> { struct Inner; } }\n\
              #[cfg(test)] mod tests { pub struct T; pub fn t() -> Result<(), T> {} }\n\
-             #[cfg(test)] impl std::error::Error for Other {}",
+             #[cfg(test)] impl std::error::Error for Other {}\n\
+             pub struct TestOnly;\n\
+             #[cfg(test)] pub fn helper() -> Result<(), TestOnly> {}\n\
+             #[test] pub fn case() -> Result<(), TestOnly> {}\n\
+             impl S { #[cfg(test)] pub fn h(&self) -> Result<(), TestOnly> {} }",
         )]);
         assert_eq!(found, BTreeMap::from([("src/p.rs::Other".to_string(), 1)]));
     }

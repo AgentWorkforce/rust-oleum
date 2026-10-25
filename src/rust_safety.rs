@@ -203,13 +203,17 @@ fn denied_in_meta(meta: &syn::Meta) -> u32 {
     if !(list.path.is_ident("deny") || list.path.is_ident("forbid")) {
         return 0;
     }
-    let Ok(lints) = list.parse_args_with(Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+    // Parse as metas so a trailing `reason = ".."` doesn't fail the parse.
+    let Ok(metas) = list.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
     else {
         return 0;
     };
-    let groups = lints
+    let groups = metas
         .iter()
-        .filter(|p| WARNING_GROUPS.contains(&path_string(p).as_str()))
+        .filter(|m| match m {
+            syn::Meta::Path(p) => WARNING_GROUPS.contains(&path_string(p).as_str()),
+            _ => false,
+        })
         .count();
     u32::try_from(groups).unwrap_or(u32::MAX)
 }
@@ -655,6 +659,12 @@ mod tests {
         // the struct's clippy::nursery; not the fn body or the test module.
         assert_eq!(c.deny_warnings_count, 5);
         assert_eq!(file_counts("#![deny(unsafe_code)]").deny_warnings_count, 0);
+        // A reason doesn't hide the denied group, bare or under cfg_attr.
+        let reasoned = r#"
+            #![deny(warnings, reason = "keep builds clean")]
+            #![cfg_attr(ci, forbid(clippy::all, unsafe_code, reason = "ci"))]
+        "#;
+        assert_eq!(file_counts(reasoned).deny_warnings_count, 2);
     }
 
     #[test]

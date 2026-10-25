@@ -174,7 +174,7 @@ pub(crate) fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// `#[test]`, `#[tokio::test]`, and friends.
-fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
     attrs
         .iter()
         .any(|a| a.path().segments.last().is_some_and(|s| s.ident == "test"))
