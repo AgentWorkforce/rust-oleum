@@ -42,6 +42,7 @@ grandfathered offender and the gate makes you lock the gain in (run
 | CRAP score | ≤ 25 per function | `--coverage` lcov file |
 | Dead code | 0 findings per item, grandfathered | `--clippy-log` JSON |
 | Redundant code | 0 findings per item, grandfathered | `--clippy-log` JSON |
+| Any clippy / rustc lint, in [lint groups](#lint-groups) you define | `max` findings per item (default 0), grandfathered | `--clippy-log` JSON |
 | Surviving mutants | 0 | `--mutants` outcomes file |
 
 Source metrics work with zero setup and skip test code (`tests/`,
@@ -65,6 +66,98 @@ finding — or `"<lint>@<file>#L<line>"` for findings outside any function
 under that key; identical diagnostics that cargo emits once per target
 (lib, bin, test) count once. `rust-oleum init --clippy-log clippy-log.json`
 grandfathers today's findings.
+
+### Lint groups
+
+Dead and redundant code are two built-in groups; every other lint in the
+log is ignored unless you put it in a group of your own. Each group gets
+its own report row and is ratcheted per item exactly like dead code:
+
+```toml
+[lint_groups.panics]
+lints = ["clippy::unwrap_used", "clippy::panic_in_result_fn"]
+max = 0                    # allowed findings per item (default 0)
+
+[lint_groups.style]
+lints = ["clippy::needless_*"]   # a trailing * matches by prefix
+```
+
+Lint names are the codes clippy reports: `clippy::<name>` for clippy
+lints, the bare name for rustc lints (`missing_docs`). Each lint may belong
+to one group only: patterns in two groups that could match the same lint
+(e.g. `clippy::needless_*` and `clippy::needless_bool`) are a config error.
+A configured group takes precedence over the built-in groups, so the
+`style` group above claims `clippy::needless_*` findings that would
+otherwise count as redundant code. Grandfathered items go under
+`[baseline.lint_groups.<group>]` with the same keys as dead code, and
+violations are reported as `lints.<group>: ...`.
+
+A lint only reaches the log if it is enabled, and many useful ones are
+allow-by-default: enable them in `Cargo.toml`'s `[lints]` table or with
+`-W` flags when producing the log.
+
+### Presets
+
+`rust-oleum init --preset beautiful-rust` writes lint groups inspired by
+the machine-checkable rules of
+[BeautifulRust](https://github.com/morganlinton/BeautifulRust) (MIT),
+pinned to its v1.2.0 lint list (commit `c9a062e`; see
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)). The preset uses only its
+individual lints: whole groups such as `clippy::pedantic` would flood the
+baseline. It also adds `clippy::ptr_arg`, which upstream gets from
+`clippy::all`. A test checks that the installed clippy recognises every
+lint name in the preset.
+
+| Group | Lints |
+|---|---|
+| `panics` | `clippy::unwrap_used`, `clippy::panic_in_result_fn` |
+| `docs` | `missing_docs`, `clippy::missing_errors_doc`, `clippy::missing_panics_doc` |
+| `api` | `clippy::fn_params_excessive_bools`, `clippy::struct_excessive_bools`, `clippy::ptr_arg`, `clippy::clone_on_ref_ptr`, `missing_debug_implementations`, `unreachable_pub` |
+| `casts` | `clippy::as_conversions`, `clippy::cast_possible_truncation`, `clippy::cast_sign_loss` |
+| `unsafe_hygiene` | `clippy::undocumented_unsafe_blocks`, `clippy::multiple_unsafe_ops_per_block`, `unsafe_op_in_unsafe_fn` |
+| `suppressions` | `clippy::allow_attributes`, `clippy::allow_attributes_without_reason` |
+| `leftovers` | `clippy::dbg_macro`, `clippy::todo`, `clippy::print_stdout`, `clippy::print_stderr` |
+
+`init` prints the clippy command that enables them all:
+
+```sh
+cargo clippy --workspace --all-targets --message-format=json -- \
+  -W clippy::unwrap_used -W clippy::panic_in_result_fn \
+  -W missing_docs -W clippy::missing_errors_doc -W clippy::missing_panics_doc \
+  -W clippy::fn_params_excessive_bools -W clippy::struct_excessive_bools -W clippy::ptr_arg \
+  -W clippy::clone_on_ref_ptr -W missing_debug_implementations -W unreachable_pub \
+  -W clippy::as_conversions -W clippy::cast_possible_truncation -W clippy::cast_sign_loss \
+  -W clippy::undocumented_unsafe_blocks -W clippy::multiple_unsafe_ops_per_block -W unsafe_op_in_unsafe_fn \
+  -W clippy::allow_attributes -W clippy::allow_attributes_without_reason \
+  -W clippy::dbg_macro -W clippy::todo -W clippy::print_stdout -W clippy::print_stderr \
+  > clippy-log.json
+```
+
+or enable them once in `Cargo.toml` (BeautifulRust's `lints/lints.toml`
+is a ready-made version of this block):
+
+```toml
+[lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+unwrap_used = "warn"
+panic_in_result_fn = "warn"
+# ... one line per clippy lint in the table above
+```
+
+and add a `clippy.toml` next to `Cargo.toml` so every `bool` parameter is
+flagged and tests may unwrap and print:
+
+```toml
+max-fn-params-bools = 0
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-print-in-tests = true
+```
 
 ## Fix hints
 
@@ -127,12 +220,16 @@ cyclomatic_max = 22
 
 [baseline.redundant_code]
 "clippy::redundant_clone@src/cli.rs::run" = 1
+
+[baseline.lint_groups.panics]
+"clippy::unwrap_used@src/cli.rs::run" = 3
 ```
 
 The gate fails on a violation that is not in the baseline, or that exceeds
-its grandfathered ceiling. For dead and redundant code the ceiling is a
-finding count per item, and `dead_code_max` / `redundant_code_max` in
-`[targets]` are the per-item allowance (default 0). The coverage floor works the same way: measured
+its grandfathered ceiling. For dead and redundant code and lint groups the
+ceiling is a finding count per item, and `dead_code_max` /
+`redundant_code_max` in `[targets]` (a group's own `max`) are the per-item
+allowance (default 0). The coverage floor works the same way: measured
 coverage may never drop below the baseline floor while you climb toward the
 target.
 
@@ -148,7 +245,7 @@ of leaving room to slide back. The gate fails when:
   meets the target.
 
 Entries for metrics that weren't measured in a run (CRAP and coverage
-without `--coverage`, dead/redundant code without `--clippy-log`) are
+without `--coverage`, dead/redundant code and lint groups without `--clippy-log`) are
 left alone.
 
 `rust-oleum --tighten` fixes all of this in place: it rewrites the

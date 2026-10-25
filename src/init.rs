@@ -7,6 +7,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::presets::Preset;
 use crate::report::insert_max;
 use crate::{config, coverage, external, report, rust_metrics};
 
@@ -43,6 +44,7 @@ pub fn run(
     repo_root: &Path,
     coverage_file: Option<&Path>,
     clippy_log: Option<&Path>,
+    preset: Option<Preset>,
     force: bool,
 ) -> Result<()> {
     let path = repo_root.join(CONFIG_FILE);
@@ -59,10 +61,11 @@ pub fn run(
     }
 
     let mut text = format!(
-        "{HEADER}\n{DEFAULT_TARGETS}\n[sources]\nrust_roots = {}\n\n",
+        "{HEADER}\n{DEFAULT_TARGETS}\n{}[sources]\nrust_roots = {}\n\n",
+        preset.map(Preset::toml).unwrap_or_default(),
         toml_array(&rust_roots),
     );
-    let cfg: config::Config = toml::from_str(&text).context("building default config")?;
+    let cfg = config::Config::parse(&text).context("building default config")?;
 
     let rust = rust_metrics::collect(repo_root, &cfg.sources.rust_roots)?;
     let cov = coverage_file
@@ -71,7 +74,7 @@ pub fn run(
     let coverage_pct = cov.as_ref().map(coverage::Coverage::total_line_coverage);
     let crap = cov.as_ref().map(|c| c.crap_scores(&rust.functions));
     let lints = clippy_log
-        .map(|p| external::parse_clippy_log(p, repo_root, &rust.functions))
+        .map(|p| external::parse_clippy_log(p, repo_root, &rust.functions, &cfg))
         .transpose()?;
 
     let baseline = baseline_toml(&cfg, &rust, coverage_pct, crap.as_deref(), lints.as_ref());
@@ -87,6 +90,9 @@ pub fn run(
         rust.functions.len(),
         grandfathered,
     );
+    if let Some(p) = preset {
+        print!("{}", p.setup_notes());
+    }
     println!("run `rust-oleum` to check the gate.");
     Ok(())
 }
@@ -207,8 +213,23 @@ pub fn baseline(
             t.redundant_code_max,
             &mut b.redundant_code,
         );
+        group_entries(config, l, &mut b);
     }
     b
+}
+
+/// Grandfather every configured lint group item over the group's `max`.
+fn group_entries(config: &config::Config, lints: &external::LintCounts, b: &mut config::Baseline) {
+    for (name, group) in &config.lint_groups {
+        let Some(found) = lints.groups.get(name) else {
+            continue;
+        };
+        let mut over = BTreeMap::new();
+        over_items(&found.items, group.max, &mut over);
+        if !over.is_empty() {
+            b.lint_groups.insert(name.clone(), over);
+        }
+    }
 }
 
 fn file_entries(t: &config::Targets, rust: &rust_metrics::RustMetrics, b: &mut config::Baseline) {
@@ -289,6 +310,10 @@ pub fn render_baseline(b: &config::Baseline) -> String {
     section(&mut out, "redundant_code", &b.redundant_code, |v| {
         v.to_string()
     });
+    for (name, entries) in &b.lint_groups {
+        let table = format!("lint_groups.{name}");
+        section(&mut out, &table, entries, |v| v.to_string());
+    }
     out
 }
 
@@ -344,7 +369,7 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path(), None, None, false).unwrap();
+        run(dir.path(), None, None, None, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
         assert_eq!(config.targets.cyclomatic_max, 22);
         assert_eq!(config.sources.rust_roots, vec!["crates/a/src"]);
@@ -360,8 +385,8 @@ mod tests {
         assert!(!b.unsafe_.contains_key("crates/a/src/lib.rs::tidy"));
 
         // Refuses to clobber without --force, allows it with.
-        assert!(run(dir.path(), None, None, false).is_err());
-        run(dir.path(), None, None, true).unwrap();
+        assert!(run(dir.path(), None, None, None, false).is_err());
+        run(dir.path(), None, None, None, true).unwrap();
     }
 
     #[test]
@@ -377,7 +402,7 @@ mod tests {
         let log_path = dir.path().join("clippy.json");
         std::fs::write(&log_path, log).unwrap();
 
-        run(dir.path(), None, Some(&log_path), false).unwrap();
+        run(dir.path(), None, Some(&log_path), None, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
         assert_eq!(
             config
@@ -392,6 +417,85 @@ mod tests {
                 .redundant_code
                 .get("clippy::needless_return@crates/a/src/lib.rs#L5"),
             Some(&1)
+        );
+    }
+
+    #[test]
+    fn init_with_a_preset_grandfathers_lint_group_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_project(dir.path());
+        let diag = |code: &str, line: usize| {
+            format!(
+                r#"{{"reason":"compiler-message","message":{{"code":{{"code":"{code}"}},"message":"m","spans":[{{"file_name":"crates/a/src/lib.rs","line_start":{line},"column_start":1,"is_primary":true}}]}}}}"#
+            ) + "\n"
+        };
+        let log =
+            diag("clippy::unwrap_used", 1) + &diag("missing_docs", 1) + &diag("clippy::todo", 7);
+        let log_path = dir.path().join("clippy.json");
+        std::fs::write(&log_path, log).unwrap();
+
+        let preset = Some(Preset::BeautifulRust);
+        run(dir.path(), None, Some(&log_path), preset, false).unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let config = config::Config::load(&path).unwrap();
+        assert_eq!(config.lint_groups.len(), 7);
+        let b = &config.baseline.lint_groups;
+        assert_eq!(
+            b["panics"],
+            BTreeMap::from([("clippy::unwrap_used@crates/a/src/lib.rs::tidy".into(), 1)])
+        );
+        assert_eq!(
+            b["docs"],
+            BTreeMap::from([("missing_docs@crates/a/src/lib.rs::tidy".into(), 1)])
+        );
+        assert_eq!(
+            b["leftovers"],
+            BTreeMap::from([("clippy::todo@crates/a/src/lib.rs#L7".into(), 1)])
+        );
+        assert_eq!(b.len(), 3);
+        // The groups precede [sources] and [baseline], so --tighten can
+        // rewrite the baseline in place.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let groups_at = text.find("[lint_groups.panics]").unwrap();
+        assert!(groups_at < text.find("[sources]").unwrap());
+        assert!(text.contains("\n[baseline.lint_groups.panics]\n\"clippy::unwrap_used@"));
+    }
+
+    #[test]
+    fn group_items_at_their_max_are_not_grandfathered() {
+        let base = format!(
+            "{DEFAULT_TARGETS}\n[lint_groups.g]\nlints = [\"x\"]\nmax = 1\n\
+             [lint_groups.quiet]\nlints = [\"y\"]\n[sources]\nrust_roots = [\"src\"]\n"
+        );
+        let cfg = config::Config::parse(&base).unwrap();
+        let mut lints = external::LintCounts::default();
+        lints.groups.insert(
+            "g".into(),
+            external::GroupCounts {
+                total: 3,
+                items: BTreeMap::from([("x@a".into(), 1), ("x@b".into(), 2)]),
+            },
+        );
+        // A group with findings, none over its max, gets no table.
+        lints.groups.insert(
+            "quiet".into(),
+            external::GroupCounts {
+                total: 0,
+                items: BTreeMap::from([("y@a".into(), 0)]),
+            },
+        );
+        let b = baseline(
+            &cfg,
+            &rust_metrics::RustMetrics::default(),
+            None,
+            None,
+            Some(&lints),
+        );
+        let expected = BTreeMap::from([("g".to_string(), BTreeMap::from([("x@b".into(), 2)]))]);
+        assert_eq!(b.lint_groups, expected);
+        assert_eq!(
+            render_baseline(&b),
+            "[baseline]\n\n[baseline.lint_groups.g]\n\"x@b\" = 2\n"
         );
     }
 

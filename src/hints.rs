@@ -17,6 +17,10 @@ const TIGHTEN: &str = "baseline";
 /// Suffix shared by every stale-baseline violation line.
 const TIGHTEN_SUFFIX: &str = "(or run --tighten)";
 
+/// Hint key shared by every configured lint group: their violations read
+/// `lints.<group>: ...`.
+const LINT_GROUPS: &str = "lints";
+
 /// Violation key (the text before the first `": "`) -> one-line fix hint.
 /// Ordered as the gate reports its rows; hints print in first-seen order.
 const HINTS: &[(&str, &str)] = &[
@@ -91,6 +95,11 @@ const HINTS: &[(&str, &str)] = &[
          don't silence it with `#[allow]`",
     ),
     (
+        LINT_GROUPS,
+        "fix what the lint reports (clippy's suggestion and the lint's docs say how); \
+         don't silence it with `#[allow]` or drop the lint from its group",
+    ),
+    (
         TIGHTEN,
         "run `rust-oleum --tighten` and commit the updated rust-oleum.toml to lock the gain in; \
          never raise a baseline ceiling by hand",
@@ -109,7 +118,11 @@ fn hint_key(violation: &str) -> &str {
     if violation.ends_with(TIGHTEN_SUFFIX) {
         return TIGHTEN;
     }
-    violation.split_once(": ").map_or(violation, |(key, _)| key)
+    let key = violation.split_once(": ").map_or(violation, |(key, _)| key);
+    if key.starts_with("lints.") {
+        return LINT_GROUPS;
+    }
+    key
 }
 
 /// One hint per metric with violations, in first-seen order. Violations of
@@ -198,6 +211,11 @@ mod tests {
             "no separator at all",
         ]));
         assert_eq!(metrics(&hints), ["dead code", "redundant code"]);
+        let groups = for_violations(&lines(&[
+            "lints.docs: missing_docs@src/lib.rs#L1 = 1 exceeds target 0 (new violation)",
+            "lints.panics: clippy::unwrap_used@src/a.rs::f = 2 exceeds target 0",
+        ]));
+        assert_eq!(metrics(&groups), ["lints"]);
         assert!(for_violations(&[]).is_empty());
     }
 
@@ -223,6 +241,7 @@ mod tests {
         let config: crate::config::Config = toml::from_str(
             "[targets]\ncyclomatic_max = 1\ncognitive_max = 1\nhalstead_difficulty_max = 1.0\n\
              file_loc_max = 1\ncrap_max = 1.0\n[sources]\nrust_roots = []\n\
+             [lint_groups.panics]\nlints = [\"clippy::unwrap_used\"]\n\
              [baseline]\ncoverage_min_pct = 60.0\n[baseline.panic]\n\"gone.rs::f\" = 1\n",
         )
         .unwrap();
@@ -257,7 +276,14 @@ mod tests {
             dead_code: 1,
             redundant: 1,
             dead_code_items: one.clone(),
-            redundant_items: one,
+            redundant_items: one.clone(),
+            groups: BTreeMap::from([(
+                "panics".to_string(),
+                crate::external::GroupCounts {
+                    total: 1,
+                    items: one,
+                },
+            )]),
             ..LintCounts::default()
         };
         let mutants = MutantCounts {

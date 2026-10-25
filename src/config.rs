@@ -8,16 +8,31 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub targets: Targets,
+    /// User-defined clippy/rustc lint groups, gated per item like dead code.
+    #[serde(default)]
+    pub lint_groups: BTreeMap<String, LintGroup>,
     #[serde(default)]
     pub baseline: Baseline,
     pub sources: Sources,
+}
+
+/// A named set of lints ratcheted together: `[lint_groups.<name>]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LintGroup {
+    /// Lint codes as they appear in the clippy log (`clippy::unwrap_used`,
+    /// `missing_docs`); a trailing `*` matches by prefix.
+    pub lints: Vec<String>,
+    /// Allowed findings per item (lint + function).
+    #[serde(default)]
+    pub max: usize,
 }
 
 /// Every target has a default, so a `[targets]` table only needs the
@@ -137,6 +152,10 @@ pub struct Baseline {
     /// "lint@file::function" (or "lint@file#Lline") -> allowed finding count.
     #[serde(default)]
     pub redundant_code: BTreeMap<String, usize>,
+    /// Lint group name -> "lint@file::function" (or "lint@file#Lline") ->
+    /// allowed finding count.
+    #[serde(default)]
+    pub lint_groups: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,7 +169,91 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        Self::parse(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Parse and validate a config document.
+    pub fn parse(text: &str) -> Result<Self> {
+        let config: Self = toml::from_str(text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Lint groups must have plain names and well-formed patterns, no lint
+    /// may match two groups, and every baselined group must be defined.
+    fn validate(&self) -> Result<()> {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for (name, group) in &self.lint_groups {
+            if !is_group_name(name) {
+                bail!(
+                    "lint group name `{name}` must be non-empty ASCII letters, digits, `_` or `-`"
+                );
+            }
+            for pattern in &group.lints {
+                check_pattern(name, pattern)?;
+                if let Some((other, p)) = seen.iter().find(|(_, p)| patterns_overlap(p, pattern)) {
+                    bail!(
+                        "lint pattern `{pattern}` in [lint_groups.{name}] overlaps `{p}` in \
+                         [lint_groups.{other}]; a lint may belong to one group only"
+                    );
+                }
+                seen.push((name, pattern));
+            }
+        }
+        if let Some(name) = self
+            .baseline
+            .lint_groups
+            .keys()
+            .find(|n| !self.lint_groups.contains_key(*n))
+        {
+            bail!("[baseline.lint_groups.{name}] has no matching [lint_groups.{name}] definition");
+        }
+        Ok(())
+    }
+
+    /// The configured lint group a lint code belongs to, if any.
+    pub fn lint_group_of(&self, code: &str) -> Option<&str> {
+        self.lint_groups
+            .iter()
+            .find(|(_, g)| g.lints.iter().any(|p| pattern_matches(p, code)))
+            .map(|(name, _)| name.as_str())
+    }
+}
+
+fn is_group_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A pattern is a lint name, optionally ending in one `*` wildcard.
+fn check_pattern(group: &str, pattern: &str) -> Result<()> {
+    let stem = pattern.strip_suffix('*').unwrap_or(pattern);
+    if stem.is_empty() || stem.contains('*') || stem.contains(char::is_whitespace) {
+        bail!(
+            "lint pattern `{pattern}` in [lint_groups.{group}] must be a lint name, \
+             optionally ending in `*`"
+        );
+    }
+    Ok(())
+}
+
+/// Exact match, or prefix match for a pattern ending in `*`.
+pub fn pattern_matches(pattern: &str, code: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => code.starts_with(prefix),
+        None => pattern == code,
+    }
+}
+
+/// Whether some lint code could match both patterns.
+fn patterns_overlap(a: &str, b: &str) -> bool {
+    match (a.strip_suffix('*'), b.strip_suffix('*')) {
+        (Some(pa), Some(pb)) => pa.starts_with(pb) || pb.starts_with(pa),
+        (Some(prefix), None) => b.starts_with(prefix),
+        (None, Some(prefix)) => a.starts_with(prefix),
+        (None, None) => a == b,
     }
 }
 
@@ -227,6 +330,88 @@ mod tests {
         assert_eq!(b.panic.get("src/a.rs::g"), Some(&3));
         assert_eq!(b.allow.get("src/a.rs::h"), Some(&1));
         assert_eq!(b.file_allow.get("src/a.rs"), Some(&4));
+    }
+
+    const GROUPS: &str = r#"
+        [targets]
+        [sources]
+        rust_roots = ["src"]
+        [lint_groups.panics]
+        lints = ["clippy::unwrap_used", "clippy::panic*"]
+        max = 2
+        [lint_groups.docs]
+        lints = ["missing_docs", "clippy::missing_*"]
+        [baseline.lint_groups.panics]
+        "clippy::unwrap_used@src/a.rs::f" = 3
+        "#;
+
+    #[test]
+    fn lint_groups_load_with_baselines() {
+        let config = Config::parse(GROUPS).unwrap();
+        let panics = &config.lint_groups["panics"];
+        assert_eq!(panics.max, 2);
+        assert_eq!(config.lint_groups["docs"].max, 0);
+        assert_eq!(
+            config.baseline.lint_groups["panics"].get("clippy::unwrap_used@src/a.rs::f"),
+            Some(&3)
+        );
+        assert_eq!(config.lint_group_of("clippy::unwrap_used"), Some("panics"));
+        assert_eq!(
+            config.lint_group_of("clippy::panic_in_result_fn"),
+            Some("panics")
+        );
+        assert_eq!(config.lint_group_of("missing_docs"), Some("docs"));
+        assert_eq!(
+            config.lint_group_of("clippy::missing_errors_doc"),
+            Some("docs")
+        );
+        assert_eq!(config.lint_group_of("clippy::missing"), None);
+        assert_eq!(config.lint_group_of("clippy::unwrap_or_default"), None);
+        assert_eq!(config.lint_group_of("missing_docs_x"), None);
+    }
+
+    fn parse_err(extra: &str) -> String {
+        let text = format!("[targets]\n[sources]\nrust_roots = []\n{extra}");
+        format!("{:#}", Config::parse(&text).unwrap_err())
+    }
+
+    #[test]
+    fn invalid_lint_groups_are_rejected() {
+        let e = parse_err("[lint_groups.a]\nlints = [\"x\", \"clippy::y*\"]\n[lint_groups.b]\nlints = [\"clippy::y_z\"]\n");
+        assert!(
+            e.contains("`clippy::y_z` in [lint_groups.b] overlaps `clippy::y*` in [lint_groups.a]"),
+            "{e}"
+        );
+        // Within one group a duplicate is an overlap too.
+        assert!(parse_err("[lint_groups.a]\nlints = [\"x\", \"x\"]\n").contains("overlaps"));
+        for bad in ["*", "a*b", "a**", "", "a b"] {
+            let e = parse_err(&format!("[lint_groups.a]\nlints = [\"{bad}\"]\n"));
+            assert!(e.contains("optionally ending in `*`"), "{bad}: {e}");
+        }
+        let e = parse_err("[lint_groups.\"a.b\"]\nlints = []\n");
+        assert!(e.contains("lint group name `a.b`"), "{e}");
+        assert!(parse_err("[lint_groups.\"\"]\nlints = []\n").contains("name ``"));
+        let e = parse_err("[baseline.lint_groups.ghost]\n\"k\" = 1\n");
+        assert!(
+            e.contains("[baseline.lint_groups.ghost] has no matching"),
+            "{e}"
+        );
+        assert!(parse_err("[lint_groups.a]\nlints = []\nbogus = 1\n").contains("bogus"));
+    }
+
+    #[test]
+    fn pattern_overlap_covers_every_shape() {
+        assert!(patterns_overlap("a*", "ab*"));
+        assert!(patterns_overlap("ab*", "a*"));
+        assert!(!patterns_overlap("ab*", "ac*"));
+        assert!(patterns_overlap("a*", "ab"));
+        assert!(patterns_overlap("ab", "a*"));
+        assert!(!patterns_overlap("b", "a*"));
+        assert!(!patterns_overlap("a*", "b"));
+        assert!(patterns_overlap("a", "a"));
+        assert!(!patterns_overlap("a", "b"));
+        assert!(is_group_name("unsafe_hygiene-2"));
+        assert!(!is_group_name("a b"));
     }
 
     #[test]

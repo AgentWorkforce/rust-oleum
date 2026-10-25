@@ -1,6 +1,7 @@
 //! Parsers for externally produced inputs: a `cargo clippy
-//! --message-format=json` log (per-item dead code + redundant code
-//! findings) and a `cargo mutants` `outcomes.json` (surviving mutants).
+//! --message-format=json` log (per-item findings for the built-in dead code
+//! and redundant code groups plus any `[lint_groups]` from the config) and a
+//! `cargo mutants` `outcomes.json` (surviving mutants).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -8,7 +9,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-use crate::config::function_key;
+use crate::config::{function_key, Config};
 use crate::rust_metrics::FunctionMetrics;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -22,6 +23,18 @@ pub struct LintCounts {
     pub dead_code_items: BTreeMap<String, usize>,
     /// Item key (see [`lint_item_key`]) -> redundant-code findings under it.
     pub redundant_items: BTreeMap<String, usize>,
+    /// Configured lint group name -> its findings (groups with no findings
+    /// are absent).
+    pub groups: BTreeMap<String, GroupCounts>,
+}
+
+/// Findings for one configured lint group.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+pub struct GroupCounts {
+    /// Total findings (after de-duplication across targets).
+    pub total: usize,
+    /// Item key (see [`lint_item_key`]) -> findings under it.
+    pub items: BTreeMap<String, usize>,
 }
 
 /// Lints that indicate unreachable / unused ("dead") code.
@@ -37,14 +50,22 @@ const DEAD_CODE_LINTS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LintKind {
+enum LintKind<'a> {
     Dead,
     Redundant,
+    /// A `[lint_groups.<name>]` from the config.
+    Group(&'a str),
 }
 
-/// Redundant code is any `clippy::redundant_*` / `clippy::needless_*` /
-/// `clippy::duplicate*` lint, plus a couple of named equivalents.
-fn lint_kind(code: &str) -> Option<LintKind> {
+/// Which group a lint is counted in. Configured lint groups win over the
+/// built-in ones, so a group can claim a lint that would otherwise count as
+/// dead or redundant code. Redundant code is any `clippy::redundant_*` /
+/// `clippy::needless_*` / `clippy::duplicate*` lint, plus a couple of named
+/// equivalents.
+fn lint_kind<'a>(code: &str, config: &'a Config) -> Option<LintKind<'a>> {
+    if let Some(group) = config.lint_group_of(code) {
+        return Some(LintKind::Group(group));
+    }
     if DEAD_CODE_LINTS.contains(&code) {
         return Some(LintKind::Dead);
     }
@@ -56,7 +77,7 @@ fn lint_kind(code: &str) -> Option<LintKind> {
     redundant.then_some(LintKind::Redundant)
 }
 
-/// One dead/redundant diagnostic, located by its primary span. Ordering and
+/// One coded diagnostic, located by its primary span. Ordering and
 /// equality cover every field, so a `BTreeSet` drops the copies cargo emits
 /// once per compiled target (lib, bin, test).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,9 +89,10 @@ struct Finding {
     message: String,
 }
 
-/// Parse a `cargo clippy --message-format=json` log into per-item
-/// dead-code and redundant-code counts. Each finding is attributed to the
-/// production function (from `functions`) whose span contains it.
+/// Parse a `cargo clippy --message-format=json` log into per-item counts
+/// for the dead-code, redundant-code, and configured lint groups. Each
+/// finding is attributed to the production function (from `functions`)
+/// whose span contains it.
 ///
 /// Errors when the log looks stale: no `compiler-message` records at all
 /// and no workspace crate actually rebuilt, which is what a warm cargo cache
@@ -79,12 +101,13 @@ pub fn parse_clippy_log(
     path: &Path,
     repo_root: &Path,
     functions: &[FunctionMetrics],
+    config: &Config,
 ) -> Result<LintCounts> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading clippy log {}", path.display()))?;
     let findings = clippy_findings(&text, repo_root)
         .with_context(|| format!("parsing clippy log {}", path.display()))?;
-    Ok(tally(&findings, functions))
+    Ok(tally(&findings, functions, config))
 }
 
 fn clippy_findings(text: &str, repo_root: &Path) -> Result<BTreeSet<Finding>> {
@@ -127,7 +150,6 @@ fn is_rebuilt_local(v: &Value) -> bool {
 
 fn finding(v: &Value, repo_root: &Path) -> Option<Finding> {
     let code = v.pointer("/message/code/code").and_then(Value::as_str)?;
-    lint_kind(code)?;
     let message = v
         .pointer("/message/message")
         .and_then(Value::as_str)
@@ -171,12 +193,20 @@ fn repo_relative(file_name: &str, repo_root: &Path) -> String {
     rel.strip_prefix("./").unwrap_or(rel).to_string()
 }
 
-fn tally(findings: &BTreeSet<Finding>, functions: &[FunctionMetrics]) -> LintCounts {
+fn tally(
+    findings: &BTreeSet<Finding>,
+    functions: &[FunctionMetrics],
+    config: &Config,
+) -> LintCounts {
     let mut counts = LintCounts::default();
     for f in findings {
-        let (total, items) = match lint_kind(&f.code) {
+        let (total, items) = match lint_kind(&f.code, config) {
             Some(LintKind::Dead) => (&mut counts.dead_code, &mut counts.dead_code_items),
             Some(LintKind::Redundant) => (&mut counts.redundant, &mut counts.redundant_items),
+            Some(LintKind::Group(name)) => {
+                let g = counts.groups.entry(name.to_string()).or_default();
+                (&mut g.total, &mut g.items)
+            }
             None => continue,
         };
         *total += 1;
@@ -298,8 +328,20 @@ mod tests {
     }
 
     fn parse(name: &str, log: &str, functions: &[FunctionMetrics]) -> Result<LintCounts> {
+        parse_with(name, log, functions, "")
+    }
+
+    /// Parse with extra config TOML (e.g. `[lint_groups]`).
+    fn parse_with(
+        name: &str,
+        log: &str,
+        functions: &[FunctionMetrics],
+        extra: &str,
+    ) -> Result<LintCounts> {
         let path = write_temp(name, log);
-        parse_clippy_log(&path, Path::new("/repo"), functions)
+        let config =
+            Config::parse(&format!("[targets]\n[sources]\nrust_roots = []\n{extra}")).unwrap();
+        parse_clippy_log(&path, Path::new("/repo"), functions, &config)
     }
 
     #[test]
@@ -372,6 +414,58 @@ mod tests {
             ])
         );
         assert_eq!(counts.examples.len(), 5);
+    }
+
+    #[test]
+    fn configured_groups_count_per_item_and_win_over_builtins() {
+        let groups = r#"
+            [lint_groups.panics]
+            lints = ["clippy::unwrap_used", "clippy::panic_in_result_fn"]
+            [lint_groups.carved]
+            lints = ["clippy::needless_pass_by_value", "unused_mut"]
+            [lint_groups.idle]
+            lints = ["clippy::todo"]
+        "#;
+        let functions = [function("src/a.rs", "f", 10, 20)];
+        let mut log = String::new();
+        // Duplicated per target: counted once.
+        log += &diag("clippy::unwrap_used", "src/a.rs", 12, 9, "used unwrap");
+        log += &diag("clippy::unwrap_used", "src/a.rs", 12, 9, "used unwrap");
+        log += &diag("clippy::unwrap_used", "src/a.rs", 14, 9, "used unwrap");
+        log += &diag("clippy::panic_in_result_fn", "src/a.rs", 3, 1, "panics");
+        // Lints a group claims leave the built-in groups.
+        log += &diag("clippy::needless_pass_by_value", "src/a.rs", 11, 1, "m");
+        log += &diag("unused_mut", "src/a.rs", 15, 1, "m");
+        // Unclaimed built-ins still count as before; ungrouped lints drop.
+        log += &diag("clippy::needless_return", "src/a.rs", 16, 1, "m");
+        log += &diag("dead_code", "src/a.rs", 17, 1, "m");
+        log += &diag("clippy::ptr_arg", "src/a.rs", 18, 1, "m");
+        let counts = parse_with("clippy-groups.json", &log, &functions, groups).unwrap();
+
+        assert_eq!(counts.dead_code, 1);
+        assert_eq!(counts.redundant, 1);
+        assert_eq!(
+            counts.groups["panics"],
+            GroupCounts {
+                total: 3,
+                items: BTreeMap::from([
+                    ("clippy::panic_in_result_fn@src/a.rs#L3".to_string(), 1),
+                    ("clippy::unwrap_used@src/a.rs::f".to_string(), 2),
+                ]),
+            }
+        );
+        assert_eq!(counts.groups["carved"].total, 2);
+        assert_eq!(
+            counts.groups["carved"].items.keys().collect::<Vec<_>>(),
+            [
+                "clippy::needless_pass_by_value@src/a.rs::f",
+                "unused_mut@src/a.rs::f"
+            ]
+        );
+        // A configured group with no findings has no entry.
+        assert!(!counts.groups.contains_key("idle"));
+        assert_eq!(counts.groups.len(), 2);
+        assert_eq!(counts.examples.len(), 7);
     }
 
     #[test]
