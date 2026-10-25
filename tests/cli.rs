@@ -522,3 +522,53 @@ fn custom_lint_groups_match_prefixes_and_reject_overlaps() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("beautiful-rust"), "{}", stderr(&out));
 }
+
+/// Every lint in the preset must be one the installed clippy recognises.
+/// Lint names change between toolchains (lints get renamed, removed or moved
+/// between groups), and clippy simply never reports a lint it doesn't know.
+/// So this runs the flags `init` prints and fails on the warnings rustc gives
+/// for unknown, renamed or removed lints named on the command line (`-D` does
+/// not apply to those, so the check reads the diagnostics).
+#[test]
+fn preset_lints_are_known_to_the_installed_clippy() {
+    let fx = Fixture::new();
+    let out = fx.run(&["init", "--preset", "beautiful-rust"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let command = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("cargo clippy "))
+        .expect("init prints the clippy command");
+    let (_, flags) = command.split_once(" -- ").unwrap();
+    let flags: Vec<&str> = flags.split_whitespace().take_while(|t| *t != ">").collect();
+    assert_eq!(flags.iter().filter(|f| **f == "-W").count(), 23);
+
+    // Isolate the nested build from this test run's own instrumentation
+    // and target directory.
+    let target = fx.root().join("target");
+    let mut cmd = Command::new(env!("CARGO"));
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "LLVM_PROFILE_FILE",
+        "CARGO_LLVM_COV",
+        "CARGO_LLVM_COV_TARGET_DIR",
+    ] {
+        cmd.env_remove(var);
+    }
+    let out = cmd
+        .current_dir(fx.root())
+        .env("CARGO_TARGET_DIR", &target)
+        .args(["clippy", "--quiet", "--offline", "--"])
+        .args(&flags)
+        .output()
+        .expect("spawn cargo clippy");
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    for bad in ["unknown lint", "has been renamed", "has been removed"] {
+        assert!(!err.contains(bad), "{err}");
+    }
+}

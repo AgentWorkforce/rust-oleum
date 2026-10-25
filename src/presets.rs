@@ -12,8 +12,38 @@ struct GroupDef {
     lints: &'static [&'static str],
 }
 
-/// The machine-checkable rules of BeautifulRust
-/// (<https://github.com/morganlinton/BeautifulRust>, MIT), grouped by intent.
+// The lint list and clippy.toml settings below are derived from the
+// individual lints in BeautifulRust v1.2.0 (commit c9a062e),
+// `lints/lints.toml` and `lints/clippy.toml`:
+// https://github.com/morganlinton/BeautifulRust
+// Its whole-group entries (`clippy::all`, `clippy::pedantic`) are left
+// out on purpose, because they would flood the baseline.
+//
+// MIT License
+//
+// Copyright (c) 2026 Morgan Linton
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+/// BeautifulRust's machine-checkable lints, grouped by intent. `clippy::ptr_arg`
+/// is an addition: it is warn-by-default in `clippy::all`, which the
+/// upstream list enables as a whole group.
 const BEAUTIFUL_RUST: &[GroupDef] = &[
     GroupDef {
         name: "panics",
@@ -33,7 +63,9 @@ const BEAUTIFUL_RUST: &[GroupDef] = &[
             "clippy::fn_params_excessive_bools",
             "clippy::struct_excessive_bools",
             "clippy::ptr_arg",
+            "clippy::clone_on_ref_ptr",
             "missing_debug_implementations",
+            "unreachable_pub",
         ],
     },
     GroupDef {
@@ -125,7 +157,7 @@ impl Preset {
     /// What `init` prints after writing a config with this preset.
     pub fn setup_notes(self) -> String {
         let mut out = format!(
-            "  lint groups: {} (preset inspired by https://github.com/morganlinton/BeautifulRust, MIT)\n\
+            "  lint groups: {} (preset inspired by BeautifulRust v1.2.0, https://github.com/morganlinton/BeautifulRust, MIT)\n\
              most of these lints are off by default, so enable them when producing the clippy log:\n  {}\n\
              and put this in clippy.toml next to Cargo.toml:\n",
             self.groups()
@@ -172,7 +204,7 @@ mod tests {
             Some("leftovers")
         );
         assert!(config.lint_groups.values().all(|g| g.max == 0));
-        assert_eq!(p.lints().count(), 21);
+        assert_eq!(p.lints().count(), 23);
         assert!(p.toml().starts_with(
             "[lint_groups.panics]\nlints = [\"clippy::unwrap_used\", \"clippy::panic_in_result_fn\"]\n\n"
         ));
@@ -195,7 +227,12 @@ mod tests {
             "{notes}"
         );
         assert!(notes.contains(&format!("\n  {cmd}\n")), "{notes}");
-        assert!(notes.contains("BeautifulRust, MIT"), "{notes}");
+        assert!(
+            notes.contains(
+                "BeautifulRust v1.2.0, https://github.com/morganlinton/BeautifulRust, MIT"
+            ),
+            "{notes}"
+        );
         assert!(notes.ends_with("  max-fn-params-bools = 0\n  allow-unwrap-in-tests = true\n  allow-expect-in-tests = true\n  allow-print-in-tests = true\n"), "{notes}");
     }
 }
