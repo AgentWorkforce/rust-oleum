@@ -371,3 +371,49 @@ fn custom_config_path_and_missing_config_error() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("reading config"), "{}", stderr(&out));
 }
+
+#[test]
+fn bare_panics_are_gated_alongside_the_unchanged_panic_metric() {
+    let fx = Fixture::new();
+    fx.write(
+        "src/lib.rs",
+        "pub fn a(x: Option<u8>) -> u8 { x.expect(\"caller checked is_some\") }\n\
+         pub fn b(x: Option<u8>) -> u8 { x.unwrap() }\n",
+    );
+    // A config written before bare_panic existed: panics grandfathered via
+    // [baseline.panic] still load and still pass the panic row.
+    fx.write(
+        "rust-oleum.toml",
+        "[targets]\npanic_max = 0\n\n[sources]\nrust_roots = [\"src\"]\n\n\
+         [baseline.panic]\n\"src/lib.rs::a\" = 1\n\"src/lib.rs::b\" = 1\n",
+    );
+    let out = fx.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("bare_panic: src/lib.rs::b = 1 exceeds target 0 (new violation)"),
+        "{err}"
+    );
+    assert!(!err.contains("src/lib.rs::a"), "{err}");
+    assert!(!err.contains("  - panic:"), "{err}");
+
+    // The regenerated baseline grandfathers only the unexplained one.
+    let text = stdout(&fx.run(&["--write-baseline"]));
+    assert!(
+        text.contains("[baseline.bare_panic]\n\"src/lib.rs::b\" = 1\n"),
+        "{text}"
+    );
+
+    // Allowing explained panics: only the bare `.unwrap()` still fails.
+    fx.write(
+        "rust-oleum.toml",
+        "[targets]\npanic_max = 1000\nbare_panic_max = 0\n\n[sources]\nrust_roots = [\"src\"]\n",
+    );
+    let out = fx.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("bare_panic: src/lib.rs::b = 1"), "{err}");
+    assert_eq!(err.matches("\n  - ").count(), 1, "{err}");
+    let table = stdout(&out);
+    assert!(table.contains("Unexplained panics (per fn)"), "{table}");
+}

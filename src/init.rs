@@ -37,6 +37,13 @@ unsafe_max = 0
 panic_max = 0
 allow_max = 0
 file_allow_max = 0
+bare_panic_max = 0
+bare_allow_max = 0
+file_bare_allow_max = 0
+deny_warnings_max = 0
+pub_wrapper_max = 0
+get_prefix_max = 0
+missing_error_impl_max = 0
 ";
 
 pub fn run(
@@ -192,6 +199,11 @@ pub fn baseline(
     };
     file_entries(t, rust, &mut b);
     function_entries(t, rust, &mut b);
+    over_items(
+        &rust.error_types,
+        t.missing_error_impl_max,
+        &mut b.missing_error_impl,
+    );
     for s in crap
         .unwrap_or_default()
         .iter()
@@ -216,8 +228,23 @@ fn file_entries(t: &config::Targets, rust: &rust_metrics::RustMetrics, b: &mut c
         if f.loc > t.file_loc_max {
             insert_max(&mut b.file_loc, f.file.clone(), f.loc);
         }
-        if f.allow_count > t.file_allow_max {
-            insert_max(&mut b.file_allow, f.file.clone(), f.allow_count);
+        let counts = [
+            (f.allow_count, t.file_allow_max, &mut b.file_allow),
+            (
+                f.bare_allow_count,
+                t.file_bare_allow_max,
+                &mut b.file_bare_allow,
+            ),
+            (
+                f.deny_warnings_count,
+                t.deny_warnings_max,
+                &mut b.deny_warnings,
+            ),
+        ];
+        for (value, max, map) in counts {
+            if value > max {
+                insert_max(map, f.file.clone(), value);
+            }
         }
     }
 }
@@ -229,29 +256,34 @@ fn function_entries(
 ) {
     for f in &rust.functions {
         let key = || config::function_key(&f.file, &f.name);
-        if f.cyclomatic > t.cyclomatic_max {
-            insert_max(&mut b.cyclomatic, key(), f.cyclomatic);
-        }
-        if f.cognitive > t.cognitive_max {
-            insert_max(&mut b.cognitive, key(), f.cognitive);
-        }
         if f.halstead_difficulty > t.halstead_difficulty_max {
             insert_max(&mut b.halstead, key(), float_ceiling(f.halstead_difficulty));
         }
-        if f.unsafe_count > t.unsafe_max {
-            insert_max(&mut b.unsafe_, key(), f.unsafe_count);
-        }
-        if f.panic_count > t.panic_max {
-            insert_max(&mut b.panic, key(), f.panic_count);
-        }
-        if f.allow_count > t.allow_max {
-            insert_max(&mut b.allow, key(), f.allow_count);
+        let counts = [
+            (f.cyclomatic, t.cyclomatic_max, &mut b.cyclomatic),
+            (f.cognitive, t.cognitive_max, &mut b.cognitive),
+            (f.unsafe_count, t.unsafe_max, &mut b.unsafe_),
+            (f.panic_count, t.panic_max, &mut b.panic),
+            (f.bare_panic_count, t.bare_panic_max, &mut b.bare_panic),
+            (f.allow_count, t.allow_max, &mut b.allow),
+            (f.bare_allow_count, t.bare_allow_max, &mut b.bare_allow),
+            (f.pub_wrapper_count, t.pub_wrapper_max, &mut b.pub_wrapper),
+            (f.get_prefix_count, t.get_prefix_max, &mut b.get_prefix),
+        ];
+        for (value, max, map) in counts {
+            if value > max {
+                insert_max(map, key(), value);
+            }
         }
     }
 }
 
 /// Copy every item whose count exceeds `max` into the baseline map.
-fn over_items(items: &BTreeMap<String, usize>, max: usize, out: &mut BTreeMap<String, usize>) {
+fn over_items<V: PartialOrd + Copy>(
+    items: &BTreeMap<String, V>,
+    max: V,
+    out: &mut BTreeMap<String, V>,
+) {
     for (k, n) in items.iter().filter(|(_, n)| **n > max) {
         insert_max(out, k.clone(), *n);
     }
@@ -285,6 +317,17 @@ pub fn render_baseline(b: &config::Baseline) -> String {
     section(&mut out, "panic", &b.panic, |v| v.to_string());
     section(&mut out, "allow", &b.allow, |v| v.to_string());
     section(&mut out, "file_allow", &b.file_allow, |v| v.to_string());
+    for (name, entries) in [
+        ("bare_panic", &b.bare_panic),
+        ("bare_allow", &b.bare_allow),
+        ("file_bare_allow", &b.file_bare_allow),
+        ("deny_warnings", &b.deny_warnings),
+        ("pub_wrapper", &b.pub_wrapper),
+        ("get_prefix", &b.get_prefix),
+        ("missing_error_impl", &b.missing_error_impl),
+    ] {
+        section(&mut out, name, entries, |v| v.to_string());
+    }
     section(&mut out, "dead_code", &b.dead_code, |v| v.to_string());
     section(&mut out, "redundant_code", &b.redundant_code, |v| {
         v.to_string()
@@ -340,7 +383,10 @@ mod tests {
         // Safety offenders must be grandfathered too.
         std::fs::write(
             dir.path().join("crates/a/src/risky.rs"),
-            "#![allow(unused)]\n#[allow(dead_code)]\nunsafe fn r() { unsafe { x() }; y.unwrap(); }\n",
+            "#![allow(unused)]\n#![deny(warnings)]\n#[allow(dead_code)]\n\
+             unsafe fn r() { unsafe { x() }; y.unwrap(); z.expect(\"why\"); }\n\
+             pub struct S;\nimpl S { pub fn get_rc(&self) -> std::rc::Rc<u8> { todo!() } }\n\
+             pub struct E;\npub fn fails() -> Result<(), E> { Ok(()) }\n",
         )
         .unwrap();
 
@@ -353,11 +399,29 @@ mod tests {
             Some(&501)
         );
         let b = &config.baseline;
-        assert_eq!(b.unsafe_.get("crates/a/src/risky.rs::r"), Some(&2));
-        assert_eq!(b.panic.get("crates/a/src/risky.rs::r"), Some(&1));
-        assert_eq!(b.allow.get("crates/a/src/risky.rs::r"), Some(&1));
-        assert_eq!(b.file_allow.get("crates/a/src/risky.rs"), Some(&1));
+        let r = "crates/a/src/risky.rs::r";
+        let get = "crates/a/src/risky.rs::S::get_rc";
+        let file = "crates/a/src/risky.rs";
+        assert_eq!(b.unsafe_.get(r), Some(&2));
+        assert_eq!(b.panic.get(r), Some(&2));
+        assert_eq!(b.bare_panic.get(r), Some(&1));
+        assert_eq!(b.allow.get(r), Some(&1));
+        assert_eq!(b.bare_allow.get(r), Some(&1));
+        assert_eq!(b.file_allow.get(file), Some(&1));
+        assert_eq!(b.file_bare_allow.get(file), Some(&1));
+        assert_eq!(b.deny_warnings.get(file), Some(&1));
+        assert_eq!(b.bare_panic.get(get), Some(&1));
+        assert_eq!(b.pub_wrapper.get(get), Some(&1));
+        assert_eq!(b.get_prefix.get(get), Some(&1));
+        assert_eq!(
+            b.missing_error_impl.get("crates/a/src/risky.rs::E"),
+            Some(&1)
+        );
         assert!(!b.unsafe_.contains_key("crates/a/src/lib.rs::tidy"));
+        // The written config passes its own gate.
+        let rust = rust_metrics::collect(dir.path(), &config.sources.rust_roots).unwrap();
+        let report = report::build(&config, &rust, None, None, None, None);
+        assert!(report.gate_passed(), "{:?}", report.violations);
 
         // Refuses to clobber without --force, allows it with.
         assert!(run(dir.path(), None, None, false).is_err());
@@ -404,9 +468,7 @@ mod tests {
             cyclomatic: cx,
             cognitive: cx,
             halstead_difficulty: halstead,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         }
     }
 
@@ -445,8 +507,10 @@ mod tests {
                 file: "src/a.rs".into(),
                 loc: 812,
                 allow_count: 0,
+                ..Default::default()
             }],
             functions,
+            ..Default::default()
         };
         // Keys needing TOML escaping survive, and duplicate keys keep the max.
         rust.functions.push(func("Q<\"x\\y\">::f", 30, 90.0));
@@ -469,8 +533,10 @@ mod tests {
                 file: "src/a.rs".into(),
                 loc: 500,
                 allow_count: 0,
+                ..Default::default()
             }],
             functions: vec![func("f", 22, 80.0)],
+            ..Default::default()
         };
         let lints = external::LintCounts {
             dead_code_items: BTreeMap::from([("d".into(), 0)]),

@@ -1,7 +1,8 @@
 //! Source-level metrics for Rust production code: per-function cyclomatic
 //! complexity, cognitive complexity (Sonar-style approximation), Halstead
 //! difficulty, per-file logical lines of code, and the Rust safety counts
-//! from [`crate::rust_safety`] (unsafe, panics, lint suppressions).
+//! from [`crate::rust_safety`] (unsafe, panics, lint suppressions) and the
+//! public-API checks from [`crate::rust_api`].
 //!
 //! Test code (`tests/` dirs, `*_tests.rs` / `tests.rs` files, `#[cfg(test)]`
 //! modules, `#[test]` functions) is excluded: the benchmark measures the
@@ -14,7 +15,7 @@ use anyhow::{Context, Result};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct FunctionMetrics {
     /// Repo-relative file path.
     pub file: String,
@@ -31,21 +32,38 @@ pub struct FunctionMetrics {
     pub panic_count: u32,
     /// Lints suppressed by `#[allow]` / `#[expect]` on or inside the fn.
     pub allow_count: u32,
+    /// Panics that don't say why they can't happen (`.unwrap()`, `todo!()`,
+    /// `assert!(c)` without a message, ...).
+    pub bare_panic_count: u32,
+    /// Suppressions not written as `#[expect(lint, reason = "..")]`.
+    pub bare_allow_count: u32,
+    /// `Rc` / `RefCell` / `Arc` / `Box` / `Cell` / `Mutex` in a `pub`
+    /// signature.
+    pub pub_wrapper_count: u32,
+    /// 1 for a `pub fn get_x(&self)` getter.
+    pub get_prefix_count: u32,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct FileMetrics {
     pub file: String,
     /// Non-blank, non-comment lines, test modules excluded.
     pub loc: usize,
     /// Lints suppressed outside functions (inner `#![allow]`, item attrs).
     pub allow_count: u32,
+    /// The subset of `allow_count` not written as `#[expect(.., reason)]`.
+    pub bare_allow_count: u32,
+    /// Warning groups (`warnings`, `clippy::all`, ...) denied in source.
+    pub deny_warnings_count: u32,
 }
 
 #[derive(Debug, Default)]
 pub struct RustMetrics {
     pub files: Vec<FileMetrics>,
     pub functions: Vec<FunctionMetrics>,
+    /// `"file::Type"` -> 1 for a public error type (defined in the crate)
+    /// without an `Error` impl, 0 for one with it.
+    pub error_types: std::collections::BTreeMap<String, u32>,
 }
 
 /// True for files that hold test code rather than shipping code.
@@ -57,14 +75,20 @@ fn is_test_path(rel: &str) -> bool {
 }
 
 /// Collect metrics for every production `.rs` file under the given roots.
+/// Each root is one crate for the crate-wide error-type scan.
 pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics> {
     let mut out = RustMetrics::default();
-    let mut rust_files = Vec::new();
     for root in source_roots {
+        let mut rust_files = Vec::new();
         collect_rust_files(&repo_root.join(root), &mut rust_files)?;
+        rust_files.sort();
+        collect_crate(repo_root, rust_files, &mut out)?;
     }
-    rust_files.sort();
+    Ok(out)
+}
 
+fn collect_crate(repo_root: &Path, rust_files: Vec<PathBuf>, out: &mut RustMetrics) -> Result<()> {
+    let mut errors = crate::rust_api::ErrorTypeScan::default();
     for path in rust_files {
         let rel = path
             .strip_prefix(repo_root)
@@ -79,11 +103,15 @@ pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics>
         let ast: syn::File =
             syn::parse_file(&src).with_context(|| format!("parsing {}", path.display()))?;
 
+        let safety = crate::rust_safety::measure_file(&ast);
         out.files.push(FileMetrics {
             file: rel.clone(),
             loc: count_loc(&src, &ast),
-            allow_count: crate::rust_safety::file_allow_count(&ast),
+            allow_count: safety.allow_count,
+            bare_allow_count: safety.bare_allow_count,
+            deny_warnings_count: safety.deny_warnings_count,
         });
+        errors.scan(&rel, &ast);
 
         let mut visitor = FnVisitor {
             file: rel,
@@ -92,7 +120,8 @@ pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics>
         };
         visitor.visit_file(&ast);
     }
-    Ok(out)
+    out.error_types.extend(errors.finish());
+    Ok(())
 }
 
 fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -161,7 +190,7 @@ struct FnVisitor<'a> {
 impl FnVisitor<'_> {
     fn record(
         &mut self,
-        sig: &syn::Signature,
+        (vis, sig): (&syn::Visibility, &syn::Signature),
         attrs: &[syn::Attribute],
         block: &syn::Block,
         span: proc_macro2::Span,
@@ -187,6 +216,10 @@ impl FnVisitor<'_> {
             unsafe_count: safety.unsafe_count,
             panic_count: safety.panic_count,
             allow_count: safety.allow_count,
+            bare_panic_count: safety.bare_panic_count,
+            bare_allow_count: safety.bare_allow_count,
+            pub_wrapper_count: crate::rust_api::pub_wrapper_count(vis, sig),
+            get_prefix_count: crate::rust_api::get_prefix_count(vis, sig),
         });
     }
 }
@@ -213,21 +246,32 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         // No recursion: closures and nested fns score as part of this body.
-        self.record(&node.sig, &node.attrs, &node.block, node.span());
+        self.record(
+            (&node.vis, &node.sig),
+            &node.attrs,
+            &node.block,
+            node.span(),
+        );
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.record(&node.sig, &node.attrs, &node.block, node.span());
+        self.record(
+            (&node.vis, &node.sig),
+            &node.attrs,
+            &node.block,
+            node.span(),
+        );
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if let Some(block) = &node.default {
-            self.record(&node.sig, &node.attrs, block, node.span());
+            let sig = (&syn::Visibility::Inherited, &node.sig);
+            self.record(sig, &node.attrs, block, node.span());
         }
     }
 }
 
-fn type_name_of(ty: &syn::Type) -> String {
+pub(crate) fn type_name_of(ty: &syn::Type) -> String {
     match ty {
         syn::Type::Path(p) => p
             .path
@@ -366,5 +410,51 @@ mod tests {
 
         let empty = collect(root, &["c/absent".to_string()]).unwrap();
         assert!(empty.files.is_empty());
+    }
+
+    #[test]
+    fn collect_records_api_counts_and_scans_errors_per_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let w = |rel: &str, content: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        };
+        // Same error name in two crates; only `b` implements `Error`, which
+        // must not excuse `a`.
+        w(
+            "a/src/lib.rs",
+            "#![deny(warnings)]\n#[allow(dead_code)]\npub struct E;\n\
+             pub fn f() -> Result<(), E> { Ok(()) }\n\
+             pub struct S;\nimpl S { pub fn get_b(&self) -> Box<u8> { x.unwrap() } }\n\
+             trait T { fn get_t(&self) -> Box<u8> { y.expect(\"why\") } }\n",
+        );
+        w(
+            "b/src/lib.rs",
+            "pub struct E;\nimpl std::error::Error for E {}\npub fn g() -> Result<(), E> { Ok(()) }\n",
+        );
+        let m = collect(root, &["a/src".to_string(), "b/src".to_string()]).unwrap();
+        assert_eq!(
+            m.error_types,
+            std::collections::BTreeMap::from([
+                ("a/src/lib.rs::E".to_string(), 1),
+                ("b/src/lib.rs::E".to_string(), 0),
+            ])
+        );
+        let a = &m.files[0];
+        assert_eq!(
+            (a.allow_count, a.bare_allow_count, a.deny_warnings_count),
+            (1, 1, 1)
+        );
+        let get_b = m.functions.iter().find(|f| f.name == "S::get_b").unwrap();
+        assert_eq!((get_b.pub_wrapper_count, get_b.get_prefix_count), (1, 1));
+        assert_eq!((get_b.panic_count, get_b.bare_panic_count), (1, 1));
+        // Trait default methods have no visibility of their own.
+        let get_t = m.functions.iter().find(|f| f.name == "get_t").unwrap();
+        assert_eq!((get_t.pub_wrapper_count, get_t.get_prefix_count), (0, 0));
+        assert_eq!((get_t.panic_count, get_t.bare_panic_count), (1, 0));
+        let f = m.functions.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!((f.pub_wrapper_count, f.get_prefix_count), (0, 0));
     }
 }

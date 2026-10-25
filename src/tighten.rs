@@ -84,6 +84,13 @@ pub fn clamp(old: &Baseline, fresh: &Baseline, measured: Measured) -> (Baseline,
         panic: clamp_map(&old.panic, &fresh.panic, &mut s),
         allow: clamp_map(&old.allow, &fresh.allow, &mut s),
         file_allow: clamp_map(&old.file_allow, &fresh.file_allow, &mut s),
+        bare_panic: clamp_map(&old.bare_panic, &fresh.bare_panic, &mut s),
+        bare_allow: clamp_map(&old.bare_allow, &fresh.bare_allow, &mut s),
+        file_bare_allow: clamp_map(&old.file_bare_allow, &fresh.file_bare_allow, &mut s),
+        deny_warnings: clamp_map(&old.deny_warnings, &fresh.deny_warnings, &mut s),
+        pub_wrapper: clamp_map(&old.pub_wrapper, &fresh.pub_wrapper, &mut s),
+        get_prefix: clamp_map(&old.get_prefix, &fresh.get_prefix, &mut s),
+        missing_error_impl: clamp_map(&old.missing_error_impl, &fresh.missing_error_impl, &mut s),
         dead_code: if measured.lints {
             clamp_map(&old.dead_code, &fresh.dead_code, &mut s)
         } else {
@@ -218,6 +225,37 @@ mod tests {
         assert!(s
             .to_string()
             .contains("1 entries removed, 1 lowered; 2 new"));
+    }
+
+    #[test]
+    fn clamp_tightens_every_source_metric() {
+        // One loose entry and one stale entry per source map: each is
+        // lowered or removed, so a missing clamp shows up in the counts.
+        let loose = || BTreeMap::from([("k".to_string(), 5u32), ("gone".to_string(), 1)]);
+        let fresh = || BTreeMap::from([("k".to_string(), 2u32)]);
+        let old = Baseline {
+            bare_panic: loose(),
+            bare_allow: loose(),
+            file_bare_allow: loose(),
+            deny_warnings: loose(),
+            pub_wrapper: loose(),
+            get_prefix: loose(),
+            missing_error_impl: loose(),
+            ..Default::default()
+        };
+        let new = Baseline {
+            bare_panic: fresh(),
+            bare_allow: fresh(),
+            file_bare_allow: fresh(),
+            deny_warnings: fresh(),
+            pub_wrapper: fresh(),
+            get_prefix: fresh(),
+            missing_error_impl: fresh(),
+            ..Default::default()
+        };
+        let (tight, s) = clamp(&old, &new, ALL);
+        assert_eq!(tight, new);
+        assert_eq!((s.removed, s.lowered, s.refused), (7, 7, 0));
     }
 
     #[test]

@@ -36,8 +36,15 @@ grandfathered offender and the gate makes you lock the gain in (run
 | Lines of code | ≤ 500 per file | source |
 | `unsafe` blocks (`unsafe fn` counts 1) | 0 per function | source |
 | Panic calls (`.unwrap()`, `.expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `assert!`/`assert_eq!`/`assert_ne!`) | 0 per function | source |
+| Unexplained panics (`.unwrap()`, `.expect("")`, message-less `panic!()`/`unreachable!()`/`assert!`/`assert_eq!`/`assert_ne!`, `todo!`, `unimplemented!`) | 0 per function | source |
 | Lint suppressions (`#[allow]` / `#[expect]`, each lint counted) | 0 per function | source |
+| Unjustified suppressions (anything but `#[expect(lint, reason = "...")]`) | 0 per function | source |
 | Lint suppressions outside functions (`#![allow]`, on mods/impls/types) | 0 per file | source |
+| Unjustified suppressions outside functions | 0 per file | source |
+| Warning groups denied in source (`#![deny(warnings)]`, `#![deny(clippy::all)]`, ...) | 0 per file | source |
+| `Rc` / `RefCell` / `Arc` / `Box` / `Cell` / `Mutex` in a `pub` fn's parameter or return types | 0 per function | source |
+| `get_`-prefixed getters (`pub fn get_x(&self)`) | 0 per function | source |
+| Public error types (returned as `E` in a `pub fn`'s `Result<_, E>`) without an `std::error::Error` impl | 0 per type | source |
 | Test coverage | 100% | `--coverage` lcov file |
 | CRAP score | ≤ 25 per function | `--coverage` lcov file |
 | Dead code | 0 findings per item, grandfathered | `--clippy-log` JSON |
@@ -65,6 +72,54 @@ finding — or `"<lint>@<file>#L<line>"` for findings outside any function
 under that key; identical diagnostics that cargo emits once per target
 (lib, bin, test) count once. `rust-oleum init --clippy-log clippy-log.json`
 grandfathers today's findings.
+
+### Panics and suppressions: explained vs. bare
+
+Both are counted twice, and the two counts gate independently:
+
+- `panic_max` / `[baseline.panic]` count **every** panic call, exactly as
+  before. `bare_panic_max` / `[baseline.bare_panic]` count the unexplained
+  subset: a panic is explained when it says why it can't happen
+  (`.expect("index checked above")`, `assert!(n > 0, "n = {n}")`,
+  `panic!("...")`). A message that is not a string literal counts as
+  explained; a blank literal does not. `todo!` and `unimplemented!` are
+  always bare.
+- `allow_max` / `file_allow_max` count every suppressed lint, as before.
+  `bare_allow_max` / `file_bare_allow_max` count those not written as
+  `#[expect(lint, reason = "...")]` — `#[expect]` warns once the lint stops
+  firing, so a justified suppression can't silently outlive its reason.
+
+With every target at its default of 0, a bare `.unwrap()` fails both rows
+and `.expect("why")` fails only the total. To adopt the "explained panics are fine" policy, raise `panic_max`
+and keep `bare_panic_max = 0`: converting `.unwrap()` to
+`.expect("why")` then pays down the ratchet, while swallowing the error with
+`.unwrap_or_default()` no longer looks like the only way to make progress.
+
+### Public API checks
+
+Where clippy is silent, rust-oleum checks a few
+[Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) rules on
+items declared `pub` (not `pub(crate)`; module reachability isn't
+resolved, and trait-impl methods never count):
+
+- wrapper types (`Rc`, `RefCell`, `Arc`, `Box`, `Cell`, `Mutex`) in a `pub`
+  fn's parameter or return types, each occurrence counted
+  (`self: Arc<Self>` receivers excepted);
+- `pub fn get_x(&self)` getters (`get_mut`, `get_ref`, `get_unchecked`,
+  `get_unchecked_mut` are fine);
+- error types defined in the crate and returned as `E` from a `pub` fn
+  (or a `pub type ... = Result<_, E>` alias) that lack an
+  `impl Error for E` or `#[derive(Error)]` / `#[derive(Snafu)]`. This is a
+  crate-wide scan per `rust_roots` entry, matching types by name; the item
+  key is `"<defining file>::<Type>"` with a value of 1 per offending type.
+
+### Upgrading
+
+New metrics default to a target of 0, so code that already violates one
+fails the gate after upgrading even though the config still loads.
+Grandfather it by running
+`rust-oleum --write-baseline` and replacing the `[baseline]` section with
+its output (or `rust-oleum init --force`).
 
 ## CI (GitHub Actions)
 

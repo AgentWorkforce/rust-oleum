@@ -271,9 +271,7 @@ mod tests {
             cyclomatic: 1,
             cognitive: 0,
             halstead_difficulty: 1.0,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         }
     }
 
