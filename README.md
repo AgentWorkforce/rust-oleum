@@ -121,7 +121,7 @@ lint name in the preset.
 `init` prints the clippy command that enables them all:
 
 ```sh
-cargo clippy --all-targets --message-format=json -- \
+cargo clippy --workspace --all-targets --message-format=json -- \
   -W clippy::unwrap_used -W clippy::panic_in_result_fn \
   -W missing_docs -W clippy::missing_errors_doc -W clippy::missing_panics_doc \
   -W clippy::fn_params_excessive_bools -W clippy::struct_excessive_bools -W clippy::ptr_arg \

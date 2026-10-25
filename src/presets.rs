@@ -149,7 +149,7 @@ impl Preset {
     pub fn clippy_command(self) -> String {
         let flags: Vec<String> = self.lints().map(|l| format!("-W {l}")).collect();
         format!(
-            "cargo clippy --all-targets --message-format=json -- {} > clippy-log.json",
+            "cargo clippy --workspace --all-targets --message-format=json -- {} > clippy-log.json",
             flags.join(" ")
         )
     }
@@ -215,7 +215,7 @@ mod tests {
         let p = Preset::BeautifulRust;
         let cmd = p.clippy_command();
         assert!(cmd.starts_with(
-            "cargo clippy --all-targets --message-format=json -- -W clippy::unwrap_used -W clippy::panic_in_result_fn -W missing_docs "
+            "cargo clippy --workspace --all-targets --message-format=json -- -W clippy::unwrap_used -W clippy::panic_in_result_fn -W missing_docs "
         ));
         assert!(
             cmd.ends_with("-W clippy::print_stderr > clippy-log.json"),

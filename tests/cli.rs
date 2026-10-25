@@ -391,7 +391,7 @@ fn init_with_preset_ratchets_lint_groups_end_to_end() {
     assert!(out.status.success(), "{}", stderr(&out));
     let text = stdout(&out);
     assert!(
-        text.contains("cargo clippy --all-targets --message-format=json -- -W clippy::unwrap_used"),
+        text.contains("cargo clippy --workspace --all-targets --message-format=json -- -W clippy::unwrap_used"),
         "{text}"
     );
     assert!(text.contains("max-fn-params-bools = 0"), "{text}");
