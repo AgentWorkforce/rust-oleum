@@ -10,6 +10,8 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::snapshot::digest;
 
+mod clippy_config;
+
 pub fn execute(
     root: &Path,
     program: &str,
@@ -218,6 +220,11 @@ pub fn controls(
             }
         }
     }
+    controls.extend(clippy_config::collect(
+        root,
+        inputs,
+        std::env::var_os("CLIPPY_CONF_DIR").as_deref(),
+    )?);
     Ok(controls)
 }
 
@@ -227,7 +234,8 @@ pub fn environment() -> BTreeMap<String, String> {
             let key = key.to_string_lossy().into_owned();
             (key.starts_with("RUST")
                 || key.starts_with("CARGO")
-                || ["CC", "CXX", "AR", "CFLAGS", "CXXFLAGS"].contains(&key.as_str()))
+                || ["CLIPPY_CONF_DIR", "CC", "CXX", "AR", "CFLAGS", "CXXFLAGS"]
+                    .contains(&key.as_str()))
             .then(|| (key, digest(value.as_encoded_bytes())))
         })
         .collect()

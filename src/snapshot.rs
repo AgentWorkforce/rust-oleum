@@ -158,7 +158,22 @@ pub fn write_new(path: &Path, value: &impl Serialize) -> Result<()> {
             path.display()
         )
     })?;
+    #[cfg(unix)]
+    sync_output_directory(parent, path)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn sync_output_directory(parent: &Path, output: &Path) -> Result<()> {
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "syncing output directory {} after publishing {}",
+                parent.display(),
+                output.display()
+            )
+        })
 }
 
 #[cfg(test)]
@@ -238,6 +253,44 @@ mod tests {
         assert!(Snapshot::load(&dir.path().join("absent")).is_err());
         std::fs::write(&path, "not JSON").unwrap();
         assert!(Snapshot::load(&path).is_err());
+    }
+
+    #[test]
+    fn precise_policy_floats_survive_sealed_snapshot_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        for (index, value) in [
+            51.248178375505404,
+            52.314008204106244,
+            97.45365320034685,
+            2.0030397744267762e-253,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut snapshot = fixture();
+            snapshot.policy.targets.halstead_difficulty_max = value;
+            snapshot.policy.targets.crap_max = value;
+            snapshot.policy.targets.coverage_min_pct = value;
+            snapshot.policy.baseline.coverage_min_pct = Some(value);
+            snapshot.policy.baseline.halstead.insert("f".into(), value);
+            snapshot.policy.baseline.crap.insert("f".into(), value);
+            snapshot.seal().unwrap();
+            let path = dir.path().join(format!("snapshot-{index}.json"));
+            write_new(&path, &snapshot).unwrap();
+            assert_eq!(Snapshot::load(&path).unwrap(), snapshot);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_errors_identify_the_published_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("missing");
+        let output = parent.join("snapshot.json");
+        let error = sync_output_directory(&parent, &output).unwrap_err();
+        let context = error.to_string();
+        assert!(context.contains("syncing output directory"));
+        assert!(context.contains(&output.display().to_string()));
     }
 
     #[test]

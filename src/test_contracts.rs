@@ -16,7 +16,16 @@ pub fn collect(root: &Path, inputs: &BTreeMap<String, String>) -> Result<Contrac
     let mut contracts = BTreeMap::new();
     let mut gates = BTreeMap::new();
     for file in inputs.keys().filter(|p| p.ends_with(".rs")) {
-        let ast = syn::parse_file(&std::fs::read_to_string(root.join(file))?)?;
+        let source = std::fs::read_to_string(root.join(file))?;
+        let Ok(ast) = syn::parse_file(&source) else {
+            // UI fixtures may deliberately contain invalid Rust. Preserve their
+            // bytes; Cargo still rejects invalid sources in compiled targets.
+            contracts.insert(
+                format!("{file}::unparsed-fixture"),
+                crate::snapshot::digest(source.as_bytes()),
+            );
+            continue;
+        };
         let mut visitor = Tests {
             scope: vec![file.clone()],
             attributes: Vec::new(),
@@ -57,6 +66,20 @@ impl<'ast> Visit<'ast> for Tests {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // An external module's file can remain in the inventory after its
+        // declaration disappears. Preserve the edge as well as its cfg/path
+        // attributes, without freezing the module's editable body.
+        let declaration = format!(
+            "mod {} {} {} {}",
+            attributes(&node.attrs),
+            node.vis.to_token_stream(),
+            node.ident,
+            node.content.is_some()
+        );
+        self.gates
+            .entry(self.scope.join("::"))
+            .or_default()
+            .push(declaration);
         self.attributes.push(attributes(&node.attrs));
         syn::visit::visit_item_mod(self, node);
         self.attributes.pop();
@@ -181,5 +204,39 @@ mod tests {
             after.gates["lib.rs::impl S T::f"]
         );
         assert_eq!(before.gates["lib.rs::T::f"], after.gates["lib.rs::T::f"]);
+    }
+
+    #[test]
+    fn module_edges_protect_attributes_and_allow_additive_tests() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = BTreeMap::from([("lib.rs".into(), "unused".into())]);
+        let path = dir.path().join("lib.rs");
+        let source = "mod cases { #[test] fn first() {} }";
+        std::fs::write(&path, source).unwrap();
+        let before = collect(dir.path(), &inputs).unwrap();
+        let gate = &before.gates["lib.rs::cases"];
+        assert_ne!(*gate, crate::snapshot::digest(b""));
+        std::fs::write(
+            &path,
+            "mod cases { #[test] fn first() {} #[test] fn second() {} }",
+        )
+        .unwrap();
+        let after = collect(dir.path(), &inputs).unwrap();
+        assert_eq!(*gate, after.gates["lib.rs::cases"]);
+        assert_eq!(
+            before.tests["lib.rs::cases::first"],
+            after.tests["lib.rs::cases::first"]
+        );
+        for replacement in [
+            "mod cases;",
+            "pub mod cases { #[test] fn first() {} }",
+            "#[cfg(any())] mod cases { #[test] fn first() {} }",
+        ] {
+            std::fs::write(&path, replacement).unwrap();
+            assert_ne!(
+                *gate,
+                collect(dir.path(), &inputs).unwrap().gates["lib.rs::cases"]
+            );
+        }
     }
 }

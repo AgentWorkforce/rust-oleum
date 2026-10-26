@@ -42,8 +42,13 @@ Cargo does execute the target repository's build scripts and tests.
 - Use a fresh temporary target directory. Run Clippy across the workspace and
   all targets, with `--force-warn` for every tracked lint. This prevents an
   attribute or lint cap from turning tracked debt into a false zero. A configured
-  `clippy.toml` can still define intentional policy such as unwraps in tests;
-  its contents are frozen for comparisons.
+  `clippy.toml` can still define intentional policy such as unwraps in tests.
+  Freeze `CLIPPY_CONF_DIR` and configuration paths and contents along ancestor
+  searches from each local manifest directory, including outside the workspace.
+  Relative overrides are checked from workspace and package directories. Both
+  config filenames and all searched ancestors are conservatively frozen, including files that
+  Clippy's nearest-file selection would currently shadow; introducing a file or
+  changing selection invalidates comparison.
 - Require successful process exit, valid JSON, a successful final
   `build-finished` record, and fresh compiler artifacts for every workspace
   member. Reject compiler errors and unknown/removed-lint diagnostics. Only
@@ -73,8 +78,8 @@ Snapshots have `schema_version: 1`, a `snapshot_sha256`, frozen `policy`, and:
 | `context` | Evaluator, compiler, Cargo/Clippy versions, resolved lint set, feature selection, build configuration and environment hashes |
 | `inputs` | Sorted map of inventoried input paths to SHA-256 hashes |
 | `entities` | Sorted inventory of source files and qualified production functions |
-| `test_contracts` | Hashes of existing test functions and ancestor attributes, normalized through Rust tokens |
-| `compilation_gates` | Conditional-compilation attributes grouped by source item; changes to existing gates require review |
+| `test_contracts` | Hashes of existing test functions and ancestor attributes, normalized through Rust tokens; raw content hashes for unparseable Rust fixtures |
+| `compilation_gates` | Conditional-compilation attributes and module declarations grouped by source item; changes to existing gates require review |
 | `checks` | `passed`, `not_measured`, or `not_applicable` (doctests without library targets) for each check |
 | `observations` | Sorted map containing all source measurements and tracked lint counts, including existing debt |
 | `findings` | All tracked Clippy diagnostics with code, message, file, line and column; no example cap |
@@ -103,11 +108,14 @@ tooling and check results produce identical serialized evidence.
 Both snapshots must use the same schema, evaluator binary, toolchain,
 measurement profile, resolved lint list, build controls, and complete policy
 (including baseline). Required checks must have passed and existing conditional-compilation gates
-must be unchanged. Source contents may
+and module declarations must be unchanged. Removing or redirecting a module
+requires review even when its source file remains in the inventory. Source contents may
 change, and new source entities and tests may be added. Removed inputs/entities
 and changed or removed existing test declarations require review and return
 `incomparable`. A change from known to unknown coverage, or the reverse, for
-an existing observation also returns `incomparable`.
+an existing observation also returns `incomparable`. Intentional syntax-error
+fixtures can remain inventoried without being parsed, but changes to their raw
+contents require review. Invalid Rust in compiled targets still fails Cargo's checks.
 
 Comparison uses target-relative debt, independently for every observation:
 

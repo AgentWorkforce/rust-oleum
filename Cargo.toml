@@ -17,7 +17,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Source-level metrics (cyclomatic / cognitive / Halstead) come from a
 # syn AST walk; span-locations turns on line/column info in proc-macro2
 # fallback spans so per-function line ranges can be joined with lcov data.
