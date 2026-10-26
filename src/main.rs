@@ -7,16 +7,22 @@
 //! Existing violations are grandfathered in a `[baseline]` section that may
 //! only shrink: new violations and regressions fail, today's debt doesn't.
 
+mod compare;
 mod complexity;
 mod config;
 mod coverage;
+mod evidence;
 mod external;
 mod init;
 mod loc;
+mod measure;
+mod observations;
 mod presets;
 mod report;
 mod rust_metrics;
 mod rust_safety;
+mod snapshot;
+mod test_contracts;
 mod tighten;
 
 use std::path::PathBuf;
@@ -28,6 +34,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "rust-oleum",
     version,
+    args_conflicts_with_subcommands = true,
     about = "A protective coating for your codebase: a code-quality ratchet gate"
 )]
 struct Args {
@@ -75,6 +82,10 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run validated checks and write an immutable measurement snapshot.
+    Measure(measure::MeasureArgs),
+    /// Compare snapshots: 0 improved, 1 unchanged/regressed, 2 incomparable.
+    Compare(compare::CompareArgs),
     /// Detect source roots, measure the project, and write a starter
     /// config whose [baseline] grandfathers today's violations.
     Init {
@@ -100,20 +111,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let repo_root = std::env::current_dir().context("resolving working directory")?;
 
-    if let Some(Command::Init {
-        coverage,
-        clippy_log,
-        preset,
-        force,
-    }) = args.command
-    {
-        return init::run(
-            &repo_root,
-            coverage.as_deref(),
-            clippy_log.as_deref(),
-            preset,
-            force,
-        );
+    if let Some(command) = args.command {
+        return run_command(&repo_root, command);
     }
 
     let config = config::Config::load(&repo_root.join(&args.config))?;
@@ -189,6 +188,31 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn run_command(root: &std::path::Path, command: Command) -> Result<()> {
+    match command {
+        Command::Measure(args) => measure::run(&root.canonicalize()?, args),
+        Command::Compare(args) => match compare::run(args) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error:#}");
+                std::process::exit(2);
+            }
+        },
+        Command::Init {
+            coverage,
+            clippy_log,
+            preset,
+            force,
+        } => init::run(
+            root,
+            coverage.as_deref(),
+            clippy_log.as_deref(),
+            preset,
+            force,
+        ),
+    }
 }
 
 /// `--write-baseline` prints the regenerated section; `--tighten` rewrites

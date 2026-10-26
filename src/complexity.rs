@@ -224,6 +224,21 @@ mod tests {
     }
 
     #[test]
+    fn else_if_chains_charge_each_condition_without_extra_nesting() {
+        let b = block("if a {} else if b {} else {}");
+        assert_eq!(cognitive(&b), 3);
+        assert_eq!(cyclomatic(&b), 3);
+    }
+
+    #[test]
+    fn match_guards_charge_logical_runs() {
+        let b = block("match x { n if a && b || c => n, _ => 0 }");
+        // One match plus two different logical runs in the guard.
+        assert_eq!(cognitive(&b), 3);
+        assert_eq!(cyclomatic(&b), 4);
+    }
+
+    #[test]
     fn cyclomatic_counts_branches() {
         // 1 base + if + && + match(3 arms - 1) = 5
         let b = block("if a && b { } match x { 1 => {}, 2 => {}, _ => {} }");
