@@ -152,7 +152,14 @@ fn collect_crate(
         };
         visitor.visit_file(&ast);
     }
-    out.error_types.extend(errors.finish());
+    // An overlapping root may scan a type twice; a narrower scan can miss an
+    // `Error` impl the broader one saw, so any scan that found it wins.
+    for (key, missing) in errors.finish() {
+        out.error_types
+            .entry(key)
+            .and_modify(|m| *m = (*m).min(missing))
+            .or_insert(missing);
+    }
     Ok(())
 }
 
@@ -509,6 +516,31 @@ mod tests {
         assert_eq!(
             m.error_types,
             std::collections::BTreeMap::from([("app/src/shared/mod.rs::AppError".to_string(), 1)])
+        );
+    }
+
+    #[test]
+    fn a_narrower_overlapping_root_cannot_hide_an_error_impl() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let w = |rel: &str, content: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        };
+        w(
+            "app/src/shared/mod.rs",
+            "pub struct AppError;\npub fn load() -> Result<(), AppError> { Ok(()) }\n",
+        );
+        w(
+            "app/src/errors.rs",
+            "impl std::error::Error for shared::AppError {}\n",
+        );
+        let roots = ["app/src".to_string(), "app/src/shared".to_string()];
+        let m = collect(root, &roots).unwrap();
+        assert_eq!(
+            m.error_types,
+            std::collections::BTreeMap::from([("app/src/shared/mod.rs::AppError".to_string(), 0)])
         );
     }
 
