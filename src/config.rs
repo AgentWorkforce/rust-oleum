@@ -8,10 +8,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use anyhow::{bail, ensure, Context, Result};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub targets: Targets,
@@ -26,7 +26,7 @@ pub struct Config {
 }
 
 /// A named set of lints ratcheted together: `[lint_groups.<name>]`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LintGroup {
     /// Lint codes as they appear in the clippy log (`clippy::unwrap_used`,
@@ -40,7 +40,7 @@ pub struct LintGroup {
 /// Every target has a default, so a `[targets]` table only needs the
 /// limits it wants to change, and configs written before a metric existed
 /// keep loading.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Targets {
     #[serde(default = "defaults::complexity_max")]
@@ -116,7 +116,7 @@ mod defaults {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Baseline {
     /// Enforced coverage floor while below the 100% target.
@@ -160,7 +160,7 @@ pub struct Baseline {
     pub lint_groups: BTreeMap<String, BTreeMap<String, usize>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sources {
     /// Roots scanned for production Rust code.
@@ -177,13 +177,14 @@ impl Config {
     /// Parse and validate a config document.
     pub fn parse(text: &str) -> Result<Self> {
         let config: Self = toml::from_str(text)?;
-        config.validate()?;
+        config.validate().context("validating config")?;
         Ok(config)
     }
 
     /// Lint groups must have plain names and well-formed patterns, no lint
     /// may match two groups, and every baselined group must be defined.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_numeric()?;
         let mut seen: Vec<(&str, &str)> = Vec::new();
         for (name, group) in &self.lint_groups {
             if !is_group_name(name) {
@@ -209,6 +210,32 @@ impl Config {
             .find(|n| !self.lint_groups.contains_key(*n))
         {
             bail!("[baseline.lint_groups.{name}] has no matching [lint_groups.{name}] definition");
+        }
+        Ok(())
+    }
+
+    /// Reject values that make comparisons meaningless or disable the gate.
+    fn validate_numeric(&self) -> Result<()> {
+        validate_percentage("targets.coverage_min_pct", self.targets.coverage_min_pct)?;
+        if let Some(floor) = self.baseline.coverage_min_pct {
+            validate_percentage("baseline.coverage_min_pct", floor)?;
+        }
+        for (name, value) in [
+            (
+                "targets.halstead_difficulty_max",
+                self.targets.halstead_difficulty_max,
+            ),
+            ("targets.crap_max", self.targets.crap_max),
+        ] {
+            validate_nonnegative(name, value)?;
+        }
+        for (name, entries) in [
+            ("baseline.halstead", &self.baseline.halstead),
+            ("baseline.crap", &self.baseline.crap),
+        ] {
+            for (key, value) in entries {
+                validate_nonnegative(&format!("{name}[{key:?}]"), *value)?;
+            }
         }
         Ok(())
     }
@@ -257,6 +284,23 @@ fn patterns_overlap(a: &str, b: &str) -> bool {
         (None, Some(prefix)) => a.starts_with(prefix),
         (None, None) => a == b,
     }
+}
+
+fn validate_nonnegative(name: &str, value: f64) -> Result<()> {
+    ensure!(
+        value.is_finite() && value >= 0.0,
+        "{name} must be finite and nonnegative, got {value}"
+    );
+    Ok(())
+}
+
+fn validate_percentage(name: &str, value: f64) -> Result<()> {
+    validate_nonnegative(name, value)?;
+    ensure!(
+        value <= 100.0,
+        "{name} must be between 0 and 100, got {value}"
+    );
+    Ok(())
 }
 
 /// Key used for per-function baseline entries.
@@ -434,5 +478,18 @@ mod tests {
         let err =
             toml::from_str::<Config>("[targets]\nbogus_max = 1\n[sources]\nrust_roots = []\n");
         assert!(err.is_err());
+    }
+    #[test]
+    fn numeric_policy_ranges_include_boundaries_and_reject_nonfinite_values() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            assert!(validate_nonnegative("metric", value).is_err());
+            assert!(validate_percentage("coverage", value).is_err());
+        }
+        for value in [0.0, 50.0, 100.0] {
+            assert!(validate_percentage("coverage", value).is_ok());
+        }
+        assert!(validate_percentage("coverage", 100.01).is_err());
+        assert!(validate_nonnegative("metric", 100.01).is_ok());
+        assert!(validate_nonnegative("metric", 0.0).is_ok());
     }
 }

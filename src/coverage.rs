@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 
 use crate::rust_metrics::FunctionMetrics;
 
@@ -28,6 +28,42 @@ pub struct CrapScore {
 }
 
 impl Coverage {
+    /// Owned measurements must be complete and usable, not an empty tracefile.
+    pub fn validate_measurement(path: &Path, root: &Path) -> Result<()> {
+        let text = std::fs::read_to_string(path)?;
+        let mut current = false;
+        let mut lines = 0;
+        for line in text.lines() {
+            if let Some(file) = line.strip_prefix("SF:") {
+                ensure!(!current && !file.is_empty(), "invalid lcov source record");
+                let source = root
+                    .join(file)
+                    .canonicalize()
+                    .context("lcov source is missing")?;
+                ensure!(
+                    source.starts_with(root),
+                    "lcov source is outside the workspace"
+                );
+                current = true;
+            } else if let Some(data) = line.strip_prefix("DA:") {
+                ensure!(current, "lcov line has no source record");
+                let mut fields = data.split(',');
+                let number: usize = fields.next().context("missing line number")?.parse()?;
+                let _: u64 = fields.next().context("missing hit count")?.parse()?;
+                ensure!(number > 0, "lcov line numbers must be positive");
+                lines += 1;
+            } else if line == "end_of_record" {
+                ensure!(current, "unexpected lcov end_of_record");
+                current = false;
+            }
+        }
+        ensure!(
+            !current && lines > 0,
+            "lcov is incomplete or contains no instrumented lines"
+        );
+        Ok(())
+    }
+
     /// Parse an lcov tracefile. `repo_root` normalizes absolute `SF:` paths.
     pub fn from_lcov(path: &Path, repo_root: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -55,11 +91,13 @@ impl Coverage {
                         .unwrap_or("0")
                         .parse()
                         .unwrap_or(0);
-                    *cov.files
+                    let count = cov
+                        .files
                         .entry(file.clone())
                         .or_default()
                         .entry(lineno)
-                        .or_insert(0) += hits;
+                        .or_insert(0);
+                    *count = count.saturating_add(hits);
                 }
             } else if line == "end_of_record" {
                 current = None;
@@ -87,6 +125,26 @@ impl Coverage {
 
     pub fn instrumented_line_count(&self) -> u64 {
         self.files.values().map(|l| l.len() as u64).sum()
+    }
+
+    /// Agent rewards cover production function lines, so adding test lines
+    /// cannot dilute uncovered production code in the aggregate percentage.
+    pub fn for_functions(&self, functions: &[FunctionMetrics]) -> Self {
+        let mut production = Self::default();
+        for f in functions {
+            if let Some(lines) = self.files.get(&f.file) {
+                for (&line, &hits) in lines {
+                    if f.start_line <= line && line <= f.end_line {
+                        production
+                            .files
+                            .entry(f.file.clone())
+                            .or_default()
+                            .insert(line, hits);
+                    }
+                }
+            }
+        }
+        production
     }
 
     /// Line coverage for a span of a file; `None` when the file (or span)
@@ -132,6 +190,17 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn empty_legacy_coverage_is_zero_and_owned_measurement_rejects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.info");
+        std::fs::write(&path, "TN:\n").unwrap();
+        let coverage = Coverage::from_lcov(&path, dir.path()).unwrap();
+        assert_eq!(coverage.instrumented_line_count(), 0);
+        assert_eq!(coverage.total_line_coverage(), 0.0);
+        assert!(Coverage::validate_measurement(&path, dir.path()).is_err());
+    }
+
     fn lcov(content: &str) -> Coverage {
         let mut f = tempfile_path();
         f.1.write_all(content.as_bytes()).unwrap();
@@ -154,6 +223,37 @@ mod tests {
         assert_eq!(cov.instrumented_line_count(), 3);
         let pct = cov.total_line_coverage();
         assert!((pct - 66.666).abs() < 0.1, "got {pct}");
+    }
+
+    #[test]
+    fn owned_lcov_requires_real_sources_valid_counts_and_complete_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn f() {}\n").unwrap();
+        let path = root.join("lcov.info");
+        for invalid in [
+            "",
+            "SF:lib.rs\nDA:1,0\n",
+            "DA:1,1\n",
+            "SF:lib.rs\nDA:0,1\nend_of_record\n",
+            "SF:lib.rs\nDA:1,-1\nend_of_record\n",
+            "SF:lib.rs\nDA:1\nend_of_record\n",
+            "SF:lib.rs\nSF:lib.rs\n",
+            "end_of_record\n",
+            "SF:absent.rs\nDA:1,0\nend_of_record\n",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(
+                Coverage::validate_measurement(&path, &root).is_err(),
+                "accepted {invalid}"
+            );
+        }
+        std::fs::write(
+            &path,
+            "TN:\nSF:lib.rs\nFN:1,f\nDA:1,0,checksum\nend_of_record\n",
+        )
+        .unwrap();
+        Coverage::validate_measurement(&path, &root).unwrap();
     }
 
     #[test]
@@ -263,5 +363,29 @@ mod tests {
         };
         // cc^2 * 1 + cc = 30
         assert!((cov.crap_scores(&[f])[0].crap - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn production_coverage_cannot_be_diluted_by_covered_test_lines() {
+        let cov = lcov("SF:/repo/src/a.rs\nDA:1,0\nDA:2,1\nDA:3,1\nDA:4,1\nend_of_record\n");
+        let f = FunctionMetrics {
+            file: "src/a.rs".into(),
+            name: "f".into(),
+            start_line: 1,
+            end_line: 1,
+            cyclomatic: 1,
+            cognitive: 0,
+            halstead_difficulty: 0.0,
+            unsafe_count: 0,
+            panic_count: 0,
+            allow_count: 0,
+        };
+        assert_eq!(cov.total_line_coverage(), 75.0);
+        let prod = cov.for_functions(&[f.clone(), f.clone()]);
+        assert_eq!(prod.instrumented_line_count(), 1);
+        assert_eq!(prod.total_line_coverage(), 0.0);
+        let mut absent = f;
+        absent.file = "absent.rs".into();
+        assert_eq!(cov.for_functions(&[absent]).instrumented_line_count(), 0);
     }
 }

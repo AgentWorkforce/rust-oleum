@@ -27,7 +27,7 @@ pub struct FunctionMetrics {
     pub halstead_difficulty: f64,
     /// `unsafe` blocks in the body, plus one for an `unsafe fn`.
     pub unsafe_count: u32,
-    /// `.unwrap()` / `.expect(..)` calls and panicking macros.
+    /// Unwrap/expect calls (including error variants) and panicking macros.
     pub panic_count: u32,
     /// Lints suppressed by `#[allow]` / `#[expect]` on or inside the fn.
     pub allow_count: u32,
@@ -58,12 +58,26 @@ fn is_test_path(rel: &str) -> bool {
 
 /// Collect metrics for every production `.rs` file under the given roots.
 pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics> {
+    collect_impl(repo_root, source_roots, false)
+}
+
+/// Snapshot identities include traits, while the legacy gate keeps its keys.
+pub fn collect_for_measure(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics> {
+    collect_impl(repo_root, source_roots, true)
+}
+
+fn collect_impl(
+    repo_root: &Path,
+    source_roots: &[String],
+    qualify_traits: bool,
+) -> Result<RustMetrics> {
     let mut out = RustMetrics::default();
     let mut rust_files = Vec::new();
     for root in source_roots {
         collect_rust_files(&repo_root.join(root), &mut rust_files)?;
     }
     rust_files.sort();
+    rust_files.dedup();
 
     for path in rust_files {
         let rel = path
@@ -86,6 +100,7 @@ pub fn collect(repo_root: &Path, source_roots: &[String]) -> Result<RustMetrics>
         });
 
         let mut visitor = FnVisitor {
+            qualify_traits,
             file: rel,
             scope: Vec::new(),
             functions: &mut out.functions,
@@ -153,6 +168,7 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
 }
 
 struct FnVisitor<'a> {
+    qualify_traits: bool,
     file: String,
     scope: Vec<String>,
     functions: &'a mut Vec<FunctionMetrics>,
@@ -206,9 +222,31 @@ impl<'ast> Visit<'ast> for FnVisitor<'_> {
         if is_cfg_test(&node.attrs) {
             return;
         }
-        self.scope.push(type_name_of(&node.self_ty));
+        let name = if self.qualify_traits {
+            use quote::ToTokens;
+            let ty = node.self_ty.to_token_stream().to_string();
+            node.trait_.as_ref().map_or(ty.clone(), |(_, path, _)| {
+                format!("<{ty} as {}>", path.to_token_stream())
+            })
+        } else {
+            type_name_of(&node.self_ty)
+        };
+        self.scope.push(name);
         syn::visit::visit_item_impl(self, node);
         self.scope.pop();
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if self.qualify_traits {
+            if is_cfg_test(&node.attrs) {
+                return;
+            }
+            self.scope.push(node.ident.to_string());
+        }
+        syn::visit::visit_item_trait(self, node);
+        if self.qualify_traits {
+            self.scope.pop();
+        }
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -244,10 +282,29 @@ fn type_name_of(ty: &syn::Type) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn measurement_keeps_production_modules_and_excludes_test_traits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "mod production { pub fn entry() {} }\n\
+             #[cfg(feature = \"optional\")] fn gated() {}\n\
+             #[cfg(test)] trait Testing { fn helper() { panic!(); } }\n\
+             trait Service { fn call() {} }\n",
+        )
+        .unwrap();
+        let measured = collect_for_measure(dir.path(), &["src".into()]).unwrap();
+        let names: Vec<_> = measured.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["production::entry", "gated", "Service::call"]);
+        assert!(measured.functions.iter().all(|f| f.panic_count == 0));
+    }
+
     fn metrics_for(src: &str) -> Vec<FunctionMetrics> {
         let ast: syn::File = syn::parse_file(src).unwrap();
         let mut functions = Vec::new();
         let mut v = FnVisitor {
+            qualify_traits: false,
             file: "test.rs".into(),
             scope: Vec::new(),
             functions: &mut functions,
