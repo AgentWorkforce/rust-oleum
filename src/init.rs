@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn init_without_sources_fails_without_writing_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let error = run(dir.path(), None, None, None, false).unwrap_err();
+        let error = run(dir.path(), None, None, Preset::BeautifulRust, false).unwrap_err();
         assert!(error.to_string().contains("no source roots found"));
         assert!(!dir.path().join(CONFIG_FILE).exists());
     }
