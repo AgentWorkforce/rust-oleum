@@ -175,6 +175,67 @@ fn gate_passes_with_exit_zero_and_prints_the_table() {
 }
 
 #[test]
+fn invalid_numeric_policy_is_rejected_before_tightening() {
+    let fx = Fixture::new();
+    for (table, field, value) in [
+        ("targets", "halstead_difficulty_max", "nan"),
+        ("targets", "crap_max", "inf"),
+        ("targets", "coverage_min_pct", "101.0"),
+        ("baseline", "coverage_min_pct", "nan"),
+        ("baseline.halstead", "\"src/lib.rs::tidy\"", "-1.0"),
+        ("baseline.crap", "\"src/lib.rs::tidy\"", "inf"),
+    ] {
+        let mut config = "[sources]\nrust_roots = [\"src\"]\n".to_string();
+        if table != "targets" {
+            config.push_str("[targets]\n");
+        }
+        config.push_str(&format!("[{table}]\n{field} = {value}\n"));
+        fx.write("rust-oleum.toml", &config);
+        for args in [vec![], vec!["--tighten"]] {
+            let out = fx.run(&args);
+            assert!(!out.status.success(), "accepted {table}.{field} = {value}");
+            assert!(
+                stderr(&out).contains("validating config"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(fx.read("rust-oleum.toml"), config);
+        }
+    }
+}
+
+#[test]
+fn malformed_mutation_report_cannot_pass_as_zero_survivors() {
+    let fx = Fixture::new();
+    assert!(fx.run(&["init"]).status.success());
+    fx.write("outcomes.json", "{}");
+    let out = fx.run(&["--mutants", "outcomes.json"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("parsing mutants outcomes"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn error_unwraps_are_gated_as_panics() {
+    let fx = Fixture::new();
+    assert!(fx.run(&["init"]).status.success());
+    fx.write(
+        "src/lib.rs",
+        "pub fn f(x: Result<(), ()>) { x.unwrap_err(); x.expect_err(\"error\"); }",
+    );
+    let out = fx.run(&[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("panic: src/lib.rs::f = 2"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn gate_fails_with_exit_one_and_writes_json_and_summary() {
     let fx = Fixture::new();
     fx.strict_config();
@@ -195,8 +256,18 @@ fn gate_fails_with_exit_one_and_writes_json_and_summary() {
         "{err}"
     );
 
+    // One hint per metric, after the violations.
+    assert!(
+        err.contains("(new violation)\nhow to fix:\n  - cyclomatic: extract named helper fns"),
+        "{err}"
+    );
+    assert!(err.contains("\n  - cognitive: flatten nesting"), "{err}");
+    assert_eq!(err.matches("how to fix:").count(), 1, "{err}");
+
     let report: serde_json::Value = serde_json::from_str(&fx.read("report.json")).unwrap();
     assert_eq!(report["violations"].as_array().unwrap().len(), 2);
+    assert_eq!(report["hints"][0]["metric"], "cyclomatic");
+    assert_eq!(report["hints"].as_array().unwrap().len(), 2);
     assert_eq!(report["rows"][0]["passes_gate"], false);
 
     // Summary is appended, not truncated, and marks the failing rows.
@@ -210,6 +281,11 @@ fn gate_fails_with_exit_one_and_writes_json_and_summary() {
         "{md}"
     );
     assert!(md.contains("**Violations:**"), "{md}");
+    assert!(
+        md.contains("(new violation)\n\n**How to fix:**\n- **cyclomatic**: extract"),
+        "{md}"
+    );
+    assert!(md.contains("\n- **cognitive**: flatten nesting"), "{md}");
 }
 
 #[test]
@@ -225,6 +301,7 @@ fn github_summary_without_violations_has_no_violations_section() {
     let md = fx.read("summary.md");
     assert!(md.contains("| ✅ | ✅ |"), "{md}");
     assert!(!md.contains("**Violations:**"), "{md}");
+    assert!(!md.contains("How to fix"), "{md}");
 }
 
 #[test]
@@ -325,6 +402,11 @@ fn tighten_rewrites_the_config_in_place() {
     assert_eq!(gate.status.code(), Some(1));
     assert!(stderr(&gate).contains("below its grandfathered ceiling 99"));
     assert!(stderr(&gate).contains("matches no function"));
+    assert!(
+        stderr(&gate).contains("how to fix:\n  - baseline: run `rust-oleum --tighten`"),
+        "{}",
+        stderr(&gate)
+    );
 
     let out = fx.run(&["--tighten"]);
     assert!(out.status.success(), "{}", stderr(&out));
@@ -413,9 +495,143 @@ fn bare_panics_are_gated_alongside_the_unchanged_panic_metric() {
     assert_eq!(out.status.code(), Some(1));
     let err = stderr(&out);
     assert!(err.contains("bare_panic: src/lib.rs::b = 1"), "{err}");
-    assert_eq!(err.matches("\n  - ").count(), 1, "{err}");
+    let (violations, _) = err.split_once("how to fix:\n").unwrap();
+    assert_eq!(violations.matches("\n  - ").count(), 1, "{err}");
     let table = stdout(&out);
     assert!(table.contains("Unexplained panics (per fn)"), "{table}");
+}
+
+/// BeautifulRust's deliberately messy `inventory.rs` (see
+/// `tests/fixtures/beautiful_rust_inventory/README.md`) in a temp crate.
+fn beautiful_rust_inventory() -> Fixture {
+    let fx = Fixture::new();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/beautiful_rust_inventory/src/lib.rs");
+    std::fs::copy(src, fx.root().join("src/lib.rs")).unwrap();
+    fx.write(
+        "Cargo.toml",
+        "[package]\nname = \"inventory\"\nversion = \"0.1.0\"\n",
+    );
+    fx
+}
+
+/// What the gate catches in the BeautifulRust inventory fixture today:
+/// (violation key, baseline table, item, value). When a metric starts
+/// flagging one of the smells below, add its rows here.
+///
+/// BeautifulRust smells in the fixture that rust-oleum does not detect yet:
+/// - bool parameters (`add_item(.., perishable: bool)`, `report(verbose: bool)`)
+///   where an enum would name the choice (the `api` lint group catches them
+///   with `--clippy-log`);
+/// - clippy findings outside the dead/redundant groups: `&String` / `&Vec`
+///   params (`ptr_arg`), `len() == 0` (`len_zero`), `new` without `Default`.
+///   (`needless_bool` and `redundant_field_names` would count as redundant
+///   code with `--clippy-log`; this test runs the source metrics only.);
+/// - check-then-unwrap (`is_some()` followed by `unwrap()`);
+/// - the error enum's `Other(String)` catch-all; public fields; missing
+///   `# Errors` docs;
+/// - string building with `+` instead of `format!`.
+const INVENTORY_CATCHES: &[(&str, &str, &str, u32)] = &[
+    ("panic", "panic", "src/lib.rs::Inventory::get_item", 1),
+    ("panic", "panic", "src/lib.rs::Inventory::load", 1),
+    ("panic", "panic", "src/lib.rs::Inventory::parse_line", 2),
+    ("panic", "panic", "src/lib.rs::Inventory::restock", 1),
+    ("panic", "panic", "src/lib.rs::Inventory::total_value", 1),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::get_item",
+        1,
+    ),
+    ("bare_panic", "bare_panic", "src/lib.rs::Inventory::load", 1),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::parse_line",
+        2,
+    ),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::restock",
+        1,
+    ),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::total_value",
+        1,
+    ),
+    // `Rc<RefCell<Inventory>>` returned from `new` and `load`.
+    (
+        "pub_wrapper",
+        "pub_wrapper",
+        "src/lib.rs::Inventory::new",
+        2,
+    ),
+    (
+        "pub_wrapper",
+        "pub_wrapper",
+        "src/lib.rs::Inventory::load",
+        2,
+    ),
+    ("deny_warnings", "deny_warnings", "src/lib.rs", 1),
+    (
+        "missing_error_impl",
+        "missing_error_impl",
+        "src/lib.rs::InventoryError",
+        1,
+    ),
+];
+
+#[test]
+fn beautiful_rust_inventory_init_grandfathers_what_the_gate_catches() {
+    let fx = beautiful_rust_inventory();
+    let out = fx.run(&["init"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let summary = format!("grandfathered {} baseline entries", INVENTORY_CATCHES.len());
+    assert!(stdout(&out).contains(&summary), "{}", stdout(&out));
+    let config = fx.read("rust-oleum.toml");
+    for (_, table, item, value) in INVENTORY_CATCHES {
+        // The entry sits in its own table: before the next `[` header.
+        let (_, table_body) = config.split_once(&format!("[baseline.{table}]\n")).unwrap();
+        let table_body = table_body.split("\n[").next().unwrap();
+        let entry = format!("\"{item}\" = {value}\n");
+        assert!(table_body.contains(&entry), "{entry} in {config}");
+    }
+    // The config init wrote passes its own gate.
+    let gate = fx.run(&[]);
+    assert!(gate.status.success(), "{}", stderr(&gate));
+}
+
+#[test]
+fn beautiful_rust_inventory_gate_flags_each_catch_with_a_fix_hint() {
+    let fx = beautiful_rust_inventory();
+    fx.write(
+        "rust-oleum.toml",
+        "[targets]\n\n[sources]\nrust_roots = [\"src\"]\n",
+    );
+    let out = fx.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    for (metric, _, item, value) in INVENTORY_CATCHES {
+        let line = format!("  - {metric}: {item} = {value} exceeds target");
+        assert!(err.contains(&line), "{line} in {err}");
+    }
+    let (violations, hints) = err.split_once("how to fix:\n").unwrap();
+    assert_eq!(
+        violations.matches("\n  - ").count(),
+        INVENTORY_CATCHES.len(),
+        "{err}"
+    );
+    // One hint per metric, not per violation.
+    let metrics: std::collections::BTreeSet<&str> =
+        INVENTORY_CATCHES.iter().map(|(m, ..)| *m).collect();
+    assert_eq!(hints.lines().count(), metrics.len(), "{err}");
+    assert!(
+        hints.starts_with("  - panic: return an error with `?`"),
+        "{err}"
+    );
 }
 
 /// One clippy `compiler-message` line for `code` at `src/lib.rs:line`.

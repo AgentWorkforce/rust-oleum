@@ -26,6 +26,35 @@ That's it. Commit `rust-oleum.toml` and put `rust-oleum` in CI. Refactor a
 grandfathered offender and the gate makes you lock the gain in (run
 `rust-oleum --tighten`): the ratchet tightens, and it never loosens.
 
+## Agent improvement loop
+
+For an agent-driven improvement loop, use `measure` and `compare`:
+
+```sh
+mkdir -p .rust-oleum
+rust-oleum measure --output .rust-oleum/before.json
+# Make one change, keeping the policy and existing tests intact.
+rust-oleum measure --output .rust-oleum/candidate.json
+rust-oleum compare --before .rust-oleum/before.json --after .rust-oleum/candidate.json
+```
+
+`measure` runs fresh workspace Clippy, explicitly enables every tracked lint,
+and runs workspace tests and doctests. It requires a lockfile and publishes a
+snapshot only after successful checks. Add `--coverage` to run `cargo-llvm-cov`;
+this is required when the baseline contains coverage or CRAP debt. Snapshot
+files are never overwritten. Measurements include existing debt even when the
+ordinary gate would fail, so partial improvements are visible.
+
+`compare` returns JSON and exits **0 for improved**, **1 for unchanged or
+regressed**, and **2 for incomparable/invalid evidence**. Policy changes,
+removed entities, changed existing tests, and incompatible measurement contexts
+require review. Improving one metric cannot compensate for increasing another
+metric's excess above its target. Reaching a target ends the reward for that
+metric. Neither command edits the baseline.
+
+See [AGENTS.md](AGENTS.md) for the operating instructions and
+[the agent protocol](docs/agent-protocol.md) for schema, validation, and limits.
+
 ## What it checks
 
 | Metric | Default target | Measured from |
@@ -35,8 +64,8 @@ grandfathered offender and the gate makes you lock the gain in (run
 | Halstead difficulty | ≤ 80 per function | source |
 | Lines of code | ≤ 500 per file | source |
 | `unsafe` blocks (`unsafe fn` counts 1) | 0 per function | source |
-| Panic calls (`.unwrap()`, `.expect()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `assert!`/`assert_eq!`/`assert_ne!`) | 0 per function | source |
-| Unexplained panics (`.unwrap()`, `.expect("")`, message-less `panic!()`/`unreachable!()`/`assert!`/`assert_eq!`/`assert_ne!`, `todo!`, `unimplemented!`) | 0 per function | source |
+| Panic calls (`.unwrap()`, `.expect()`, `.unwrap_err()`, `.expect_err()`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `assert!`/`assert_eq!`/`assert_ne!`) | 0 per function | source |
+| Unexplained panics (`.unwrap()`, `.unwrap_err()`, `.expect("")`/`.expect_err("")`, message-less `panic!()`/`unreachable!()`/`assert!`/`assert_eq!`/`assert_ne!`, `todo!`, `unimplemented!`) | 0 per function | source |
 | Lint suppressions (`#[allow]` / `#[expect]`, each lint counted) | 0 per function | source |
 | Unjustified suppressions (anything but `#[expect(lint, reason = "...")]`) | 0 per function | source |
 | Lint suppressions outside functions (`#![allow]`, on mods/impls/types) | 0 per file | source |
@@ -62,6 +91,10 @@ cargo mutants --in-diff pr.diff
 
 rust-oleum --coverage lcov.info --clippy-log clippy-log.json --mutants mutants.out/outcomes.json
 ```
+
+Mutation reports must contain nonnegative integer `total_mutants`, `caught`,
+`missed`, `timeout`, and `unviable` counts and an `outcomes` array. Missing or
+malformed fields fail the run instead of being treated as zero survivors.
 
 Dead code (`dead_code`, `unused_*`, `unreachable_*`) and redundant code
 (`clippy::redundant_*`, `clippy::needless_*`, `clippy::duplicate*`, ...)
@@ -214,6 +247,27 @@ allow-expect-in-tests = true
 allow-print-in-tests = true
 ```
 
+## Fix hints
+
+The gate's output is often read by coding agents, and a bare
+`panic: src/x.rs::f = 2 exceeds target 0` invites the cheapest dodge. So
+after the violations list, the gate prints one hint per failing metric (not
+per violation) naming the proper fix, the dodge to avoid, and the rule it
+comes from where there is one:
+
+```text
+how to fix:
+  - panic: return an error with `?` or handle the `None`/`Err` case explicitly; `expect("why")` still counts, so keep one only as a reviewed baseline entry; don't hide the failure with `unwrap_or_default()` (BeautifulRust §5, Rust API Guidelines C-GOOD-ERR)
+```
+
+Loose or stale baseline entries get one hint to run `rust-oleum --tighten`.
+The hints also appear in the `--github-summary` markdown and as `hints` in
+the `--json` report. Citations point to
+[BeautifulRust](https://github.com/morganlinton/BeautifulRust)'s
+`rust-best-practices` skill, which distills the Rust API Guidelines,
+Effective Rust and other guides. All hints live in one table in
+`src/hints.rs`, keyed by the metric's violation prefix.
+
 ## CI (GitHub Actions)
 
 ```yaml
@@ -258,6 +312,10 @@ cyclomatic_max = 22
 [baseline.lint_groups.panics]
 "clippy::unwrap_used@src/cli.rs::run" = 3
 ```
+
+Numeric targets and baseline values must be finite and nonnegative;
+coverage percentages must be between 0 and 100 inclusive. Invalid values
+are rejected before gating or rewriting the baseline.
 
 The gate fails on a violation that is not in the baseline, or that exceeds
 its grandfathered ceiling. For dead and redundant code and lint groups the

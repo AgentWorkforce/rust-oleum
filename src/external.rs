@@ -19,6 +19,8 @@ pub struct LintCounts {
     /// Total redundant-code findings (after de-duplication across targets).
     pub redundant: usize,
     pub examples: Vec<String>,
+    /// Every tracked diagnostic, without the human report's example cap.
+    pub findings: Vec<Finding>,
     /// Item key (see [`lint_item_key`]) -> dead-code findings under it.
     pub dead_code_items: BTreeMap<String, usize>,
     /// Item key (see [`lint_item_key`]) -> redundant-code findings under it.
@@ -57,6 +59,11 @@ enum LintKind<'a> {
     Group(&'a str),
 }
 
+/// Whether a named lint contributes to this policy's measurements.
+pub fn tracked_lint(code: &str, config: &Config) -> bool {
+    lint_kind(code, config).is_some()
+}
+
 /// Which group a lint is counted in. Configured lint groups win over the
 /// built-in ones, so a group can claim a lint that would otherwise count as
 /// dead or redundant code. Redundant code is any `clippy::redundant_*` /
@@ -80,13 +87,14 @@ fn lint_kind<'a>(code: &str, config: &'a Config) -> Option<LintKind<'a>> {
 /// One coded diagnostic, located by its primary span. Ordering and
 /// equality cover every field, so a `BTreeSet` drops the copies cargo emits
 /// once per compiled target (lib, bin, test).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct Finding {
-    code: String,
-    file: String,
-    line: usize,
-    column: usize,
-    message: String,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Finding {
+    pub code: String,
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
 }
 
 /// Parse a `cargo clippy --message-format=json` log into per-item counts
@@ -212,6 +220,7 @@ fn tally(
         *total += 1;
         let key = lint_item_key(&f.code, &f.file, f.line, functions);
         *items.entry(key).or_insert(0) += 1;
+        counts.findings.push(f.clone());
         if counts.examples.len() < 20 {
             counts
                 .examples
@@ -245,6 +254,18 @@ pub struct MutantCounts {
     pub missed_examples: Vec<String>,
 }
 
+/// Required counts are typed so missing, negative, or malformed values
+/// cannot silently become zero. Ignore extra fields for tool compatibility.
+#[derive(serde::Deserialize)]
+struct MutantOutcomes {
+    total_mutants: usize,
+    caught: usize,
+    missed: usize,
+    timeout: usize,
+    unviable: usize,
+    outcomes: Vec<Value>,
+}
+
 /// Parse `mutants.out/outcomes.json` from cargo-mutants. The file carries
 /// authoritative top-level counts (`total_mutants`, `missed`, `caught`,
 /// `timeout`, `unviable`); the per-outcome list is only walked to name the
@@ -252,22 +273,17 @@ pub struct MutantCounts {
 pub fn parse_mutants_outcomes(path: &Path) -> Result<MutantCounts> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading mutants outcomes {}", path.display()))?;
-    let v: Value = serde_json::from_str(&text).context("parsing mutants outcomes JSON")?;
-    let count = |key: &str| v.get(key).and_then(Value::as_u64).unwrap_or(0) as usize;
+    let input: MutantOutcomes = serde_json::from_str(&text)
+        .with_context(|| format!("parsing mutants outcomes JSON {}", path.display()))?;
     let mut counts = MutantCounts {
-        total: count("total_mutants"),
-        caught: count("caught"),
-        missed: count("missed"),
-        timeout: count("timeout"),
-        unviable: count("unviable"),
+        total: input.total_mutants,
+        caught: input.caught,
+        missed: input.missed,
+        timeout: input.timeout,
+        unviable: input.unviable,
         missed_examples: Vec::new(),
     };
-    let outcomes = v
-        .get("outcomes")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for o in &outcomes {
+    for o in &input.outcomes {
         if o.get("summary").and_then(Value::as_str) != Some("MissedMutant") {
             continue;
         }
@@ -560,6 +576,52 @@ mod tests {
         assert_eq!(counts.caught, 1);
         assert_eq!(counts.missed, 1);
         assert_eq!(counts.missed_examples, vec!["replace foo -> bar"]);
+    }
+
+    #[test]
+    fn mutant_report_requires_unsigned_counts_and_an_outcomes_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcomes.json");
+        let valid = serde_json::json!({
+            "total_mutants": 0, "caught": 0, "missed": 0,
+            "timeout": 0, "unviable": 0, "outcomes": [],
+            "cargo_mutants_version": "future-version"
+        });
+        for key in [
+            "total_mutants",
+            "caught",
+            "missed",
+            "timeout",
+            "unviable",
+            "outcomes",
+        ] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            std::fs::write(&path, missing.to_string()).unwrap();
+            assert!(
+                parse_mutants_outcomes(&path).is_err(),
+                "accepted absent {key}"
+            );
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(0.5),
+                serde_json::json!("0"),
+                Value::Null,
+            ] {
+                let mut report = valid.clone();
+                report[key] = invalid;
+                std::fs::write(&path, report.to_string()).unwrap();
+                assert!(
+                    parse_mutants_outcomes(&path).is_err(),
+                    "accepted invalid {key}"
+                );
+            }
+        }
+        // A valid empty run is distinct from a missing or malformed report.
+        std::fs::write(&path, valid.to_string()).unwrap();
+        let counts = parse_mutants_outcomes(&path).unwrap();
+        assert_eq!(counts.total, 0);
+        assert_eq!(counts.missed, 0);
     }
 
     #[test]

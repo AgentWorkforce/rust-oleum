@@ -31,8 +31,8 @@ const PANIC_MACROS: &[&str] = &[
     "assert_ne",
 ];
 
-/// Methods that panic on the error / `None` path.
-const PANIC_METHODS: &[&str] = &["unwrap", "expect"];
+/// Methods that panic on an unexpected variant (including `Ok`).
+const PANIC_METHODS: &[&str] = &["unwrap", "expect", "unwrap_err", "expect_err"];
 
 /// Lint groups whose membership grows with the toolchain: denying them in
 /// source turns a compiler upgrade into a broken build. Deny them in CI
@@ -412,6 +412,8 @@ mod tests {
             r#"fn f() {
                 a.unwrap();
                 b.expect("msg");
+                c.unwrap_err();
+                d.expect_err("msg");
                 panic!("boom");
                 std::unreachable!();
                 todo!();
@@ -421,7 +423,7 @@ mod tests {
                 let y = { assert_ne!(a, b); 1 };
             }"#,
         );
-        assert_eq!(c.panic_count, 9);
+        assert_eq!(c.panic_count, 11);
     }
 
     #[test]
@@ -431,7 +433,6 @@ mod tests {
                 a.unwrap_or(1);
                 a.unwrap_or_default();
                 a.unwrap_or_else(|| 2);
-                a.expect_err("x");
                 debug_assert!(x);
                 debug_assert_eq!(a, b);
                 unwrap(a);
