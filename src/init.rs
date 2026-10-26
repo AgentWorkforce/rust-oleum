@@ -297,22 +297,25 @@ pub fn render_baseline(b: &config::Baseline) -> String {
     if let Some(floor) = b.coverage_min_pct {
         let _ = writeln!(out, "coverage_min_pct = {floor:?}");
     }
-    section(&mut out, "file_loc", &b.file_loc, |v| v.to_string());
-    section(&mut out, "cyclomatic", &b.cyclomatic, |v| v.to_string());
-    section(&mut out, "cognitive", &b.cognitive, |v| v.to_string());
+    section(&mut out, "file_loc", &b.file_loc, ToString::to_string);
+    section(&mut out, "cyclomatic", &b.cyclomatic, ToString::to_string);
+    section(&mut out, "cognitive", &b.cognitive, ToString::to_string);
     section(&mut out, "halstead", &b.halstead, |v| format!("{v:?}"));
     section(&mut out, "crap", &b.crap, |v| format!("{v:?}"));
-    section(&mut out, "unsafe", &b.unsafe_, |v| v.to_string());
-    section(&mut out, "panic", &b.panic, |v| v.to_string());
-    section(&mut out, "allow", &b.allow, |v| v.to_string());
-    section(&mut out, "file_allow", &b.file_allow, |v| v.to_string());
-    section(&mut out, "dead_code", &b.dead_code, |v| v.to_string());
-    section(&mut out, "redundant_code", &b.redundant_code, |v| {
-        v.to_string()
-    });
+    section(&mut out, "unsafe", &b.unsafe_, ToString::to_string);
+    section(&mut out, "panic", &b.panic, ToString::to_string);
+    section(&mut out, "allow", &b.allow, ToString::to_string);
+    section(&mut out, "file_allow", &b.file_allow, ToString::to_string);
+    section(&mut out, "dead_code", &b.dead_code, ToString::to_string);
+    section(
+        &mut out,
+        "redundant_code",
+        &b.redundant_code,
+        ToString::to_string,
+    );
     for (name, entries) in &b.lint_groups {
         let table = format!("lint_groups.{name}");
-        section(&mut out, &table, entries, |v| v.to_string());
+        section(&mut out, &table, entries, ToString::to_string);
     }
     out
 }
@@ -332,6 +335,32 @@ fn section<V>(out: &mut String, name: &str, entries: &BTreeMap<String, V>, fmt: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_without_sources_fails_without_writing_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = run(dir.path(), None, None, None, false).unwrap_err();
+        assert!(error.to_string().contains("no source roots found"));
+        assert!(!dir.path().join(CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn detects_nested_sources_but_ignores_empty_and_hidden_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for package in ["nested", "empty", "hidden"] {
+            let package = root.join(package);
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            std::fs::write(package.join("Cargo.toml"), "[package]\n").unwrap();
+        }
+        std::fs::create_dir_all(root.join("nested/src/module")).unwrap();
+        std::fs::write(root.join("nested/src/module/code.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(root.join("empty/src/notes.txt"), "not Rust").unwrap();
+        std::fs::create_dir_all(root.join("hidden/src/.generated")).unwrap();
+        std::fs::write(root.join("hidden/src/.generated/code.rs"), "fn f() {}\n").unwrap();
+        assert_eq!(detect_roots(root).unwrap(), vec!["nested/src"]);
+        assert!(!contains_ext(&root.join("missing"), &["rs"]));
+    }
 
     fn fake_project(root: &Path) {
         let w = |rel: &str, content: &str| {

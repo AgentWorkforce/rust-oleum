@@ -175,6 +175,67 @@ fn gate_passes_with_exit_zero_and_prints_the_table() {
 }
 
 #[test]
+fn invalid_numeric_policy_is_rejected_before_tightening() {
+    let fx = Fixture::new();
+    for (table, field, value) in [
+        ("targets", "halstead_difficulty_max", "nan"),
+        ("targets", "crap_max", "inf"),
+        ("targets", "coverage_min_pct", "101.0"),
+        ("baseline", "coverage_min_pct", "nan"),
+        ("baseline.halstead", "\"src/lib.rs::tidy\"", "-1.0"),
+        ("baseline.crap", "\"src/lib.rs::tidy\"", "inf"),
+    ] {
+        let mut config = "[sources]\nrust_roots = [\"src\"]\n".to_string();
+        if table != "targets" {
+            config.push_str("[targets]\n");
+        }
+        config.push_str(&format!("[{table}]\n{field} = {value}\n"));
+        fx.write("rust-oleum.toml", &config);
+        for args in [vec![], vec!["--tighten"]] {
+            let out = fx.run(&args);
+            assert!(!out.status.success(), "accepted {table}.{field} = {value}");
+            assert!(
+                stderr(&out).contains("validating config"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(fx.read("rust-oleum.toml"), config);
+        }
+    }
+}
+
+#[test]
+fn malformed_mutation_report_cannot_pass_as_zero_survivors() {
+    let fx = Fixture::new();
+    assert!(fx.run(&["init"]).status.success());
+    fx.write("outcomes.json", "{}");
+    let out = fx.run(&["--mutants", "outcomes.json"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("parsing mutants outcomes"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn error_unwraps_are_gated_as_panics() {
+    let fx = Fixture::new();
+    assert!(fx.run(&["init"]).status.success());
+    fx.write(
+        "src/lib.rs",
+        "pub fn f(x: Result<(), ()>) { x.unwrap_err(); x.expect_err(\"error\"); }",
+    );
+    let out = fx.run(&[]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("panic: src/lib.rs::f = 2"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn gate_fails_with_exit_one_and_writes_json_and_summary() {
     let fx = Fixture::new();
     fx.strict_config();
