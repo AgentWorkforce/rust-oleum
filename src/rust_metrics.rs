@@ -9,6 +9,7 @@
 //! shipping surface, and test tables/fixtures legitimately trade these
 //! metrics for readability.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -91,14 +92,19 @@ fn collect_impl(
     qualify_traits: bool,
 ) -> Result<RustMetrics> {
     let mut out = RustMetrics::default();
-    // Overlapping roots list some files twice; measure each file once.
-    let mut seen = std::collections::BTreeSet::new();
+    // Overlapping roots list some files twice: measure each file once, but
+    // give every root's error-type scan its whole crate.
+    let mut seen = BTreeSet::new();
     for root in source_roots {
         let mut rust_files = Vec::new();
         collect_rust_files(&repo_root.join(root), &mut rust_files)?;
         rust_files.sort();
-        rust_files.retain(|f| seen.insert(f.clone()));
-        collect_crate(repo_root, rust_files, qualify_traits, &mut out)?;
+        let measured: BTreeSet<PathBuf> = rust_files
+            .iter()
+            .filter(|f| seen.insert((*f).clone()))
+            .cloned()
+            .collect();
+        collect_crate(repo_root, rust_files, &measured, qualify_traits, &mut out)?;
     }
     Ok(out)
 }
@@ -106,6 +112,7 @@ fn collect_impl(
 fn collect_crate(
     repo_root: &Path,
     rust_files: Vec<PathBuf>,
+    measured: &BTreeSet<PathBuf>,
     qualify_traits: bool,
     out: &mut RustMetrics,
 ) -> Result<()> {
@@ -124,6 +131,10 @@ fn collect_crate(
         let ast: syn::File =
             syn::parse_file(&src).with_context(|| format!("parsing {}", path.display()))?;
 
+        errors.scan(&rel, &ast);
+        if !measured.contains(&path) {
+            continue;
+        }
         let safety = crate::rust_safety::measure_file(&ast);
         out.files.push(FileMetrics {
             file: rel.clone(),
@@ -132,7 +143,6 @@ fn collect_crate(
             bare_allow_count: safety.bare_allow_count,
             deny_warnings_count: safety.deny_warnings_count,
         });
-        errors.scan(&rel, &ast);
 
         let mut visitor = FnVisitor {
             qualify_traits,
@@ -474,6 +484,32 @@ mod tests {
 
         let empty = collect(root, &["c/absent".to_string()]).unwrap();
         assert!(empty.files.is_empty());
+    }
+
+    #[test]
+    fn overlapping_roots_measure_files_once_but_scan_errors_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let w = |rel: &str, content: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        };
+        w("app/src/shared/mod.rs", "pub struct AppError;\n");
+        w(
+            "app/src/api.rs",
+            "pub fn load() -> Result<(), shared::AppError> { Ok(()) }\n",
+        );
+        let roots = ["app/src/shared".to_string(), "app/src".to_string()];
+        let m = collect(root, &roots).unwrap();
+        let files: Vec<&str> = m.files.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(files, ["app/src/shared/mod.rs", "app/src/api.rs"]);
+        // The second root's scan still sees the definition the first root
+        // already measured.
+        assert_eq!(
+            m.error_types,
+            std::collections::BTreeMap::from([("app/src/shared/mod.rs::AppError".to_string(), 1)])
+        );
     }
 
     #[test]
