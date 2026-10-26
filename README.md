@@ -192,6 +192,27 @@ allow-expect-in-tests = true
 allow-print-in-tests = true
 ```
 
+## Fix hints
+
+The gate's output is often read by coding agents, and a bare
+`panic: src/x.rs::f = 2 exceeds target 0` invites the cheapest dodge. So
+after the violations list, the gate prints one hint per failing metric (not
+per violation) naming the proper fix, the dodge to avoid, and the rule it
+comes from where there is one:
+
+```text
+how to fix:
+  - panic: return an error with `?` or handle the `None`/`Err` case explicitly; `expect("why")` still counts, so keep one only as a reviewed baseline entry; don't hide the failure with `unwrap_or_default()` (BeautifulRust §5, Rust API Guidelines C-GOOD-ERR)
+```
+
+Loose or stale baseline entries get one hint to run `rust-oleum --tighten`.
+The hints also appear in the `--github-summary` markdown and as `hints` in
+the `--json` report. Citations point to
+[BeautifulRust](https://github.com/morganlinton/BeautifulRust)'s
+`rust-best-practices` skill, which distills the Rust API Guidelines,
+Effective Rust and other guides. All hints live in one table in
+`src/hints.rs`, keyed by the metric's violation prefix.
+
 ## CI (GitHub Actions)
 
 ```yaml
