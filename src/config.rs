@@ -64,7 +64,8 @@ pub struct Targets {
     /// `unsafe` blocks (plus `unsafe fn`) per function.
     #[serde(default)]
     pub unsafe_max: u32,
-    /// `.unwrap()` / `.expect()` / panicking macros per function.
+    /// `.unwrap()` / `.expect()` / panicking macros per function, explained
+    /// or not.
     #[serde(default)]
     pub panic_max: u32,
     /// Lints suppressed by `#[allow]` / `#[expect]` per function.
@@ -73,6 +74,33 @@ pub struct Targets {
     /// Lints suppressed outside functions, per file.
     #[serde(default)]
     pub file_allow_max: u32,
+    /// Unexplained panics per function: `.unwrap()`, `.expect("")`,
+    /// message-less `panic!` / `unreachable!` / `assert*!`, `todo!`,
+    /// `unimplemented!`. A subset of `panic_max`'s count.
+    #[serde(default)]
+    pub bare_panic_max: u32,
+    /// Lints suppressed per function other than by
+    /// `#[expect(lint, reason = "..")]`. A subset of `allow_max`'s count.
+    #[serde(default)]
+    pub bare_allow_max: u32,
+    /// The same, outside functions, per file.
+    #[serde(default)]
+    pub file_bare_allow_max: u32,
+    /// Warning groups (`warnings`, `clippy::all`, ...) denied in source,
+    /// per file.
+    #[serde(default)]
+    pub deny_warnings_max: u32,
+    /// `Rc` / `RefCell` / `Arc` / `Box` / `Cell` / `Mutex` in a `pub` fn's
+    /// parameter and return types.
+    #[serde(default)]
+    pub pub_wrapper_max: u32,
+    /// `pub fn get_x(&self)` getters per function (0 or 1).
+    #[serde(default)]
+    pub get_prefix_max: u32,
+    /// Public error types without an `std::error::Error` impl, per type
+    /// (0 or 1).
+    #[serde(default)]
+    pub missing_error_impl_max: u32,
 }
 
 impl Default for Targets {
@@ -91,6 +119,13 @@ impl Default for Targets {
             panic_max: 0,
             allow_max: 0,
             file_allow_max: 0,
+            bare_panic_max: 0,
+            bare_allow_max: 0,
+            file_bare_allow_max: 0,
+            deny_warnings_max: 0,
+            pub_wrapper_max: 0,
+            get_prefix_max: 0,
+            missing_error_impl_max: 0,
         }
     }
 }
@@ -146,6 +181,27 @@ pub struct Baseline {
     /// file path -> allowed file-level lint-suppression count.
     #[serde(default)]
     pub file_allow: BTreeMap<String, u32>,
+    /// "file::function" -> allowed unexplained-panic count.
+    #[serde(default)]
+    pub bare_panic: BTreeMap<String, u32>,
+    /// "file::function" -> allowed unjustified-suppression count.
+    #[serde(default)]
+    pub bare_allow: BTreeMap<String, u32>,
+    /// file path -> allowed file-level unjustified-suppression count.
+    #[serde(default)]
+    pub file_bare_allow: BTreeMap<String, u32>,
+    /// file path -> allowed count of warning groups denied in source.
+    #[serde(default)]
+    pub deny_warnings: BTreeMap<String, u32>,
+    /// "file::function" -> allowed wrapper types in its `pub` signature.
+    #[serde(default)]
+    pub pub_wrapper: BTreeMap<String, u32>,
+    /// "file::function" -> 1 for a grandfathered `get_` getter.
+    #[serde(default)]
+    pub get_prefix: BTreeMap<String, u32>,
+    /// "file::Type" -> 1 for a grandfathered error type without `Error`.
+    #[serde(default)]
+    pub missing_error_impl: BTreeMap<String, u32>,
     /// "lint@file::function" (or "lint@file#Lline") -> allowed finding count.
     #[serde(default)]
     pub dead_code: BTreeMap<String, usize>,
@@ -344,6 +400,13 @@ mod tests {
         assert_eq!(t.panic_max, 0);
         assert_eq!(t.allow_max, 0);
         assert_eq!(t.file_allow_max, 0);
+        assert_eq!(t.bare_panic_max, 0);
+        assert_eq!(t.bare_allow_max, 0);
+        assert_eq!(t.file_bare_allow_max, 0);
+        assert_eq!(t.deny_warnings_max, 0);
+        assert_eq!(t.pub_wrapper_max, 0);
+        assert_eq!(t.get_prefix_max, 0);
+        assert_eq!(t.missing_error_impl_max, 0);
         let d = Targets::default();
         assert_eq!(
             (d.cyclomatic_max, d.file_loc_max, d.crap_max),
@@ -366,10 +429,31 @@ mod tests {
             "src/a.rs::h" = 1
             [baseline.file_allow]
             "src/a.rs" = 4
+            [baseline.bare_panic]
+            "src/a.rs::g" = 2
+            [baseline.bare_allow]
+            "src/a.rs::h" = 1
+            [baseline.file_bare_allow]
+            "src/a.rs" = 3
+            [baseline.deny_warnings]
+            "src/lib.rs" = 1
+            [baseline.pub_wrapper]
+            "src/a.rs::k" = 2
+            [baseline.get_prefix]
+            "src/a.rs::S::get_x" = 1
+            [baseline.missing_error_impl]
+            "src/e.rs::MyError" = 1
             "#,
         )
         .unwrap();
         let b = &config.baseline;
+        assert_eq!(b.bare_panic.get("src/a.rs::g"), Some(&2));
+        assert_eq!(b.bare_allow.get("src/a.rs::h"), Some(&1));
+        assert_eq!(b.file_bare_allow.get("src/a.rs"), Some(&3));
+        assert_eq!(b.deny_warnings.get("src/lib.rs"), Some(&1));
+        assert_eq!(b.pub_wrapper.get("src/a.rs::k"), Some(&2));
+        assert_eq!(b.get_prefix.get("src/a.rs::S::get_x"), Some(&1));
+        assert_eq!(b.missing_error_impl.get("src/e.rs::MyError"), Some(&1));
         assert_eq!(b.unsafe_.get("src/a.rs::f"), Some(&2));
         assert_eq!(b.panic.get("src/a.rs::g"), Some(&3));
         assert_eq!(b.allow.get("src/a.rs::h"), Some(&1));

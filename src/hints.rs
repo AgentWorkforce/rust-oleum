@@ -95,6 +95,47 @@ const HINTS: &[(&str, &str)] = &[
          don't silence it with `#[allow]`",
     ),
     (
+        "bare_panic",
+        "say why it can't fail: `expect(\"why\")`, or `assert!(cond, \"msg with values\")`; \
+         better still return an error with `?`; never swap in `unwrap_or_default()` to hide it \
+         (BeautifulRust §5)",
+    ),
+    (
+        "bare_allow",
+        "fix the lint; if it truly doesn't apply, write `#[expect(lint, reason = \"...\")]` so \
+         the suppression explains itself and warns once it is stale; don't move it to a \
+         module-level `#![allow]` (BeautifulRust §2)",
+    ),
+    (
+        "file_bare_allow",
+        "fix the lints; set project-wide levels once in `Cargo.toml` `[lints]`, and give any \
+         item-level suppression `#[expect(lint, reason = \"...\")]`; don't scatter bare \
+         `#[allow]`s onto each fn instead (BeautifulRust §2)",
+    ),
+    (
+        "deny_warnings",
+        "delete `#![deny(warnings)]`-style attributes: a new toolchain's warnings would break \
+         the build; enforce warnings-as-errors in CI (`cargo clippy -- -D warnings`) instead, and \
+         don't hide the attribute behind `cfg_attr` (BeautifulRust §2)",
+    ),
+    (
+        "pub_wrapper",
+        "take `&T`, `&mut T` or `T` and let callers choose ownership; keep `Rc`/`Arc`/`RefCell` \
+         inside the type; don't just hide the wrapper behind a type alias \
+         (BeautifulRust §3, Rust API Guidelines C-CALLER-CONTROL)",
+    ),
+    (
+        "get_prefix",
+        "name the getter after the field (`fn name(&self)`), without `get_`; don't dodge it \
+         with `fetch_` or `read_` prefixes (Rust API Guidelines C-GETTER)",
+    ),
+    (
+        "missing_error_impl",
+        "implement `Display` and `std::error::Error` (e.g. `#[derive(thiserror::Error)]`) for \
+         every public error type; don't fall back to `String` or `Box<dyn Error>` errors \
+         (Rust API Guidelines C-GOOD-ERR)",
+    ),
+    (
         LINT_GROUPS,
         "fix what the lint reports (clippy's suggestion and the lint's docs say how); \
          don't silence it with `#[allow]` or drop the lint from its group",
@@ -250,6 +291,8 @@ mod tests {
                 file: "a.rs".into(),
                 loc: 2,
                 allow_count: 1,
+                bare_allow_count: 1,
+                deny_warnings_count: 1,
             }],
             functions: vec![FunctionMetrics {
                 file: "a.rs".into(),
@@ -262,7 +305,12 @@ mod tests {
                 unsafe_count: 1,
                 panic_count: 1,
                 allow_count: 1,
+                bare_panic_count: 1,
+                bare_allow_count: 1,
+                pub_wrapper_count: 1,
+                get_prefix_count: 1,
             }],
+            error_types: BTreeMap::from([("a.rs::E".to_string(), 1)]),
         };
         let crap = [CrapScore {
             file: "a.rs".into(),

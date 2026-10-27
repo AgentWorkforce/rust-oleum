@@ -267,9 +267,7 @@ mod tests {
             cyclomatic: 4,
             cognitive: 0,
             halstead_difficulty: 0.0,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         };
         let scores = cov.crap_scores(&[f]);
         assert_eq!(scores.len(), 1);
@@ -297,9 +295,7 @@ mod tests {
             cyclomatic: 2,
             cognitive: 0,
             halstead_difficulty: 0.0,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         };
         let scores = cov.crap_scores(&[f(1, 1)]);
         assert_eq!(scores[0].coverage_pct, 100.0);
@@ -320,9 +316,7 @@ mod tests {
             cyclomatic: 2,
             cognitive: 0,
             halstead_difficulty: 0.0,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         };
         assert!(cov.crap_scores(&[f]).is_empty());
     }
@@ -339,9 +333,7 @@ mod tests {
             cyclomatic: 3,
             cognitive: 0,
             halstead_difficulty: 0.0,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         };
         assert_eq!(cov.crap_scores(&[f])[0].crap, 4.125);
     }
@@ -357,9 +349,7 @@ mod tests {
             cyclomatic: 5,
             cognitive: 0,
             halstead_difficulty: 0.0,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         };
         // cc^2 * 1 + cc = 30
         assert!((cov.crap_scores(&[f])[0].crap - 30.0).abs() < 1e-9);
@@ -376,9 +366,7 @@ mod tests {
             cyclomatic: 1,
             cognitive: 0,
             halstead_difficulty: 0.0,
-            unsafe_count: 0,
-            panic_count: 0,
-            allow_count: 0,
+            ..Default::default()
         };
         assert_eq!(cov.total_line_coverage(), 75.0);
         let prod = cov.for_functions(&[f.clone(), f.clone()]);
