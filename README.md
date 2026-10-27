@@ -286,11 +286,13 @@ Effective Rust and other guides. All hints live in one table in
 
 The `--github-summary` flag renders the metric table on the workflow run page.
 
-**Enable the default lints.** Most lints in the default lint groups are off
-unless enabled, and a lint that never reaches the log reads as "no
-findings". Produce the log with the `-W` flags `init` prints (see
-[Default lint groups](#default-lint-groups-beautifulrust)), or enable them
-in `Cargo.toml`'s `[lints]` table.
+**Enable the default lints before creating the baseline.** Most lints in
+the default lint groups are off unless enabled, and a lint that never
+reaches the log reads as "no findings". Produce the log with the `-W` flags
+`init` prints (see [Default lint groups](#default-lint-groups-beautifulrust)),
+or enable them in `Cargo.toml`'s `[lints]` table. Then create the baseline
+from that log with `rust-oleum init --clippy-log clippy-log.json`, so
+existing findings are grandfathered before the gate runs in CI.
 
 **Warm caches.** If cargo considers your crates up to date (e.g. a cached
 `target/`, or a prior `cargo check`), `cargo clippy` may lint nothing and
