@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub targets: Targets,
-    /// User-defined clippy/rustc lint groups, gated per item like dead code.
-    #[serde(default)]
+    /// Clippy/rustc lint groups, gated per item like dead code. Without a
+    /// `[lint_groups]` section the BeautifulRust groups apply; any
+    /// `[lint_groups]` table, even an empty one, replaces them.
+    #[serde(default = "crate::presets::default_lint_groups")]
     pub lint_groups: BTreeMap<String, LintGroup>,
     #[serde(default)]
     pub baseline: Baseline,
@@ -472,6 +474,19 @@ mod tests {
         [baseline.lint_groups.panics]
         "clippy::unwrap_used@src/a.rs::f" = 3
         "#;
+
+    #[test]
+    fn beautiful_rust_groups_are_the_default_and_any_table_replaces_them() {
+        let bare = "[targets]\n[sources]\nrust_roots = []\n";
+        let config = Config::parse(bare).unwrap();
+        assert_eq!(config.lint_groups.len(), 7);
+        assert_eq!(config.lint_group_of("clippy::unwrap_used"), Some("panics"));
+        let opted_out = Config::parse(&format!("{bare}[lint_groups]\n")).unwrap();
+        assert!(opted_out.lint_groups.is_empty());
+        let own = Config::parse(&format!("{bare}[lint_groups.x]\nlints = [\"y\"]\n")).unwrap();
+        assert_eq!(own.lint_groups.keys().collect::<Vec<_>>(), ["x"]);
+        assert_eq!(own.lint_group_of("clippy::unwrap_used"), None);
+    }
 
     #[test]
     fn lint_groups_load_with_baselines() {

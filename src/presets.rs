@@ -1,10 +1,15 @@
-//! Lint group presets for `rust-oleum init --preset`.
+//! Lint group presets for `rust-oleum init --preset`, and the default
+//! lint groups a config gets when it declares none.
 //!
 //! A preset is a set of `[lint_groups]` tables plus the clippy setup that
 //! makes those lints show up in the `--clippy-log` (most are
 //! allow-by-default, and an unemitted lint can't be ratcheted).
+//! BeautifulRust is the default: rust-oleum's opinion of good Rust.
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
+
+use crate::config::LintGroup;
 
 /// A named lint group inside a preset.
 struct GroupDef {
@@ -110,27 +115,52 @@ allow-expect-in-tests = true
 allow-print-in-tests = true
 ";
 
+/// The lint groups a config gets when it has no `[lint_groups]` section.
+pub fn default_lint_groups() -> BTreeMap<String, LintGroup> {
+    Preset::BeautifulRust
+        .groups()
+        .iter()
+        .map(|g| {
+            let group = LintGroup {
+                lints: g.lints.iter().map(|l| (*l).to_string()).collect(),
+                max: 0,
+            };
+            (g.name.to_string(), group)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Preset {
-    /// Lint groups mirroring BeautifulRust's machine-checkable rules.
+    /// Lint groups mirroring BeautifulRust's machine-checkable rules (the
+    /// default).
     BeautifulRust,
+    /// No lint groups: writes an empty `[lint_groups]` table, opting out of
+    /// the defaults.
+    None,
 }
 
 impl Preset {
     fn groups(self) -> &'static [GroupDef] {
         match self {
             Preset::BeautifulRust => BEAUTIFUL_RUST,
+            Preset::None => &[],
         }
     }
 
     fn clippy_toml(self) -> &'static str {
         match self {
             Preset::BeautifulRust => BEAUTIFUL_RUST_CLIPPY_TOML,
+            Preset::None => "",
         }
     }
 
-    /// The `[lint_groups.*]` tables for the config file.
+    /// The `[lint_groups.*]` tables for the config file. With no groups,
+    /// an empty `[lint_groups]` table, which opts out of the defaults.
     pub fn toml(self) -> String {
+        if self.groups().is_empty() {
+            return "[lint_groups]\n\n".to_string();
+        }
         let mut out = String::new();
         for g in self.groups() {
             let lints: Vec<String> = g.lints.iter().map(|l| format!("\"{l}\"")).collect();
@@ -156,6 +186,9 @@ impl Preset {
 
     /// What `init` prints after writing a config with this preset.
     pub fn setup_notes(self) -> String {
+        if self.groups().is_empty() {
+            return "  lint groups: none (opted out of the BeautifulRust defaults)\n".to_string();
+        }
         let mut out = format!(
             "  lint groups: {} (preset inspired by BeautifulRust v1.2.0, https://github.com/morganlinton/BeautifulRust, MIT)\n\
              most of these lints are off by default, so enable them when producing the clippy log:\n  {}\n\

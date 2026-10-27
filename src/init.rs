@@ -51,7 +51,7 @@ pub fn run(
     repo_root: &Path,
     coverage_file: Option<&Path>,
     clippy_log: Option<&Path>,
-    preset: Option<Preset>,
+    preset: Preset,
     force: bool,
 ) -> Result<()> {
     let path = repo_root.join(CONFIG_FILE);
@@ -69,7 +69,7 @@ pub fn run(
 
     let mut text = format!(
         "{HEADER}\n{DEFAULT_TARGETS}\n{}[sources]\nrust_roots = {}\n\n",
-        preset.map(Preset::toml).unwrap_or_default(),
+        preset.toml(),
         toml_array(&rust_roots),
     );
     let cfg = config::Config::parse(&text).context("building default config")?;
@@ -97,9 +97,7 @@ pub fn run(
         rust.functions.len(),
         grandfathered,
     );
-    if let Some(p) = preset {
-        print!("{}", p.setup_notes());
-    }
+    print!("{}", preset.setup_notes());
     println!("run `rust-oleum` to check the gate.");
     Ok(())
 }
@@ -382,7 +380,7 @@ mod tests {
     #[test]
     fn init_without_sources_fails_without_writing_policy() {
         let dir = tempfile::tempdir().unwrap();
-        let error = run(dir.path(), None, None, None, false).unwrap_err();
+        let error = run(dir.path(), None, None, Preset::BeautifulRust, false).unwrap_err();
         assert!(error.to_string().contains("no source roots found"));
         assert!(!dir.path().join(CONFIG_FILE).exists());
     }
@@ -444,9 +442,11 @@ mod tests {
         )
         .unwrap();
 
-        run(dir.path(), None, None, None, false).unwrap();
+        run(dir.path(), None, None, Preset::BeautifulRust, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
         assert_eq!(config.targets.cyclomatic_max, 22);
+        // The default preset writes the BeautifulRust groups explicitly.
+        assert_eq!(config.lint_groups, crate::presets::default_lint_groups());
         assert_eq!(config.sources.rust_roots, vec!["crates/a/src"]);
         assert_eq!(
             config.baseline.file_loc.get("crates/a/src/big.rs"),
@@ -478,8 +478,13 @@ mod tests {
         assert!(report.gate_passed(), "{:?}", report.violations);
 
         // Refuses to clobber without --force, allows it with.
-        assert!(run(dir.path(), None, None, None, false).is_err());
-        run(dir.path(), None, None, None, true).unwrap();
+        assert!(run(dir.path(), None, None, Preset::BeautifulRust, false).is_err());
+        // `--preset none` opts out with an explicit empty table.
+        run(dir.path(), None, None, Preset::None, true).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(text.contains("\n[lint_groups]\n\n[sources]\n"), "{text}");
+        let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(config.lint_groups.is_empty());
     }
 
     #[test]
@@ -495,7 +500,7 @@ mod tests {
         let log_path = dir.path().join("clippy.json");
         std::fs::write(&log_path, log).unwrap();
 
-        run(dir.path(), None, Some(&log_path), None, false).unwrap();
+        run(dir.path(), None, Some(&log_path), Preset::None, false).unwrap();
         let config = config::Config::load(&dir.path().join(CONFIG_FILE)).unwrap();
         assert_eq!(
             config
@@ -527,8 +532,14 @@ mod tests {
         let log_path = dir.path().join("clippy.json");
         std::fs::write(&log_path, log).unwrap();
 
-        let preset = Some(Preset::BeautifulRust);
-        run(dir.path(), None, Some(&log_path), preset, false).unwrap();
+        run(
+            dir.path(),
+            None,
+            Some(&log_path),
+            Preset::BeautifulRust,
+            false,
+        )
+        .unwrap();
         let path = dir.path().join(CONFIG_FILE);
         let config = config::Config::load(&path).unwrap();
         assert_eq!(config.lint_groups.len(), 7);

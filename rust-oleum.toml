@@ -19,6 +19,10 @@ panic_max = 0
 allow_max = 0
 file_allow_max = 0
 
+# Opted out of the default BeautifulRust lint groups until CI produces the
+# clippy log with their lints enabled; an unenabled lint reads as zero.
+[lint_groups]
+
 [sources]
 rust_roots = ["src"]
 
