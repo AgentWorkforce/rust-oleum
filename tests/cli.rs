@@ -454,6 +454,53 @@ fn custom_config_path_and_missing_config_error() {
     assert!(stderr(&out).contains("reading config"), "{}", stderr(&out));
 }
 
+#[test]
+fn bare_panics_are_gated_alongside_the_unchanged_panic_metric() {
+    let fx = Fixture::new();
+    fx.write(
+        "src/lib.rs",
+        "pub fn a(x: Option<u8>) -> u8 { x.expect(\"caller checked is_some\") }\n\
+         pub fn b(x: Option<u8>) -> u8 { x.unwrap() }\n",
+    );
+    // A config written before bare_panic existed: panics grandfathered via
+    // [baseline.panic] still load and still pass the panic row.
+    fx.write(
+        "rust-oleum.toml",
+        "[targets]\npanic_max = 0\n\n[sources]\nrust_roots = [\"src\"]\n\n\
+         [baseline.panic]\n\"src/lib.rs::a\" = 1\n\"src/lib.rs::b\" = 1\n",
+    );
+    let out = fx.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("bare_panic: src/lib.rs::b = 1 exceeds target 0 (new violation)"),
+        "{err}"
+    );
+    assert!(!err.contains("src/lib.rs::a"), "{err}");
+    assert!(!err.contains("  - panic:"), "{err}");
+
+    // The regenerated baseline grandfathers only the unexplained one.
+    let text = stdout(&fx.run(&["--write-baseline"]));
+    assert!(
+        text.contains("[baseline.bare_panic]\n\"src/lib.rs::b\" = 1\n"),
+        "{text}"
+    );
+
+    // Allowing explained panics: only the bare `.unwrap()` still fails.
+    fx.write(
+        "rust-oleum.toml",
+        "[targets]\npanic_max = 1000\nbare_panic_max = 0\n\n[sources]\nrust_roots = [\"src\"]\n",
+    );
+    let out = fx.run(&[]);
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("bare_panic: src/lib.rs::b = 1"), "{err}");
+    let (violations, _) = err.split_once("how to fix:\n").unwrap();
+    assert_eq!(violations.matches("\n  - ").count(), 1, "{err}");
+    let table = stdout(&out);
+    assert!(table.contains("Unexplained panics (per fn)"), "{table}");
+}
+
 /// BeautifulRust's deliberately messy `inventory.rs` (see
 /// `tests/fixtures/beautiful_rust_inventory/README.md`) in a temp crate.
 fn beautiful_rust_inventory() -> Fixture {
@@ -473,17 +520,16 @@ fn beautiful_rust_inventory() -> Fixture {
 /// flagging one of the smells below, add its rows here.
 ///
 /// BeautifulRust smells in the fixture that rust-oleum does not detect yet:
-/// - `#![deny(warnings)]` in source (BeautifulRust §2: deny in CI instead);
 /// - bool parameters (`add_item(.., perishable: bool)`, `report(verbose: bool)`)
-///   where an enum would name the choice;
-/// - `Rc<RefCell<..>>` in the public API (`Inventory::new`, `Inventory::load`);
+///   where an enum would name the choice (the `api` lint group catches them
+///   with `--clippy-log`);
 /// - clippy findings outside the dead/redundant groups: `&String` / `&Vec`
 ///   params (`ptr_arg`), `len() == 0` (`len_zero`), `new` without `Default`.
 ///   (`needless_bool` and `redundant_field_names` would count as redundant
 ///   code with `--clippy-log`; this test runs the source metrics only.);
 /// - check-then-unwrap (`is_some()` followed by `unwrap()`);
-/// - an error enum without `Display` / `std::error::Error` and with an
-///   `Other(String)` catch-all; public fields; missing `# Errors` docs;
+/// - the error enum's `Other(String)` catch-all; public fields; missing
+///   `# Errors` docs;
 /// - string building with `+` instead of `format!`.
 const INVENTORY_CATCHES: &[(&str, &str, &str, u32)] = &[
     ("panic", "panic", "src/lib.rs::Inventory::get_item", 1),
@@ -491,6 +537,51 @@ const INVENTORY_CATCHES: &[(&str, &str, &str, u32)] = &[
     ("panic", "panic", "src/lib.rs::Inventory::parse_line", 2),
     ("panic", "panic", "src/lib.rs::Inventory::restock", 1),
     ("panic", "panic", "src/lib.rs::Inventory::total_value", 1),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::get_item",
+        1,
+    ),
+    ("bare_panic", "bare_panic", "src/lib.rs::Inventory::load", 1),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::parse_line",
+        2,
+    ),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::restock",
+        1,
+    ),
+    (
+        "bare_panic",
+        "bare_panic",
+        "src/lib.rs::Inventory::total_value",
+        1,
+    ),
+    // `Rc<RefCell<Inventory>>` returned from `new` and `load`.
+    (
+        "pub_wrapper",
+        "pub_wrapper",
+        "src/lib.rs::Inventory::new",
+        2,
+    ),
+    (
+        "pub_wrapper",
+        "pub_wrapper",
+        "src/lib.rs::Inventory::load",
+        2,
+    ),
+    ("deny_warnings", "deny_warnings", "src/lib.rs", 1),
+    (
+        "missing_error_impl",
+        "missing_error_impl",
+        "src/lib.rs::InventoryError",
+        1,
+    ),
 ];
 
 #[test]
@@ -534,7 +625,9 @@ fn beautiful_rust_inventory_gate_flags_each_catch_with_a_fix_hint() {
         "{err}"
     );
     // One hint per metric, not per violation.
-    assert_eq!(hints.lines().count(), 1, "{err}");
+    let metrics: std::collections::BTreeSet<&str> =
+        INVENTORY_CATCHES.iter().map(|(m, ..)| *m).collect();
+    assert_eq!(hints.lines().count(), metrics.len(), "{err}");
     assert!(
         hints.starts_with("  - panic: return an error with `?`"),
         "{err}"

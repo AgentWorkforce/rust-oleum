@@ -38,6 +38,16 @@ pub fn collect(
                 u64::from(file.allow_count),
                 u64::from(t.file_allow_max),
             ),
+            (
+                "file_bare_allow",
+                u64::from(file.bare_allow_count),
+                u64::from(t.file_bare_allow_max),
+            ),
+            (
+                "deny_warnings",
+                u64::from(file.deny_warnings_count),
+                u64::from(t.deny_warnings_max),
+            ),
         ] {
             insert(
                 &mut out,
@@ -62,6 +72,10 @@ pub fn collect(
             ("unsafe", f.unsafe_count, t.unsafe_max),
             ("panic", f.panic_count, t.panic_max),
             ("allow", f.allow_count, t.allow_max),
+            ("bare_panic", f.bare_panic_count, t.bare_panic_max),
+            ("bare_allow", f.bare_allow_count, t.bare_allow_max),
+            ("pub_wrapper", f.pub_wrapper_count, t.pub_wrapper_max),
+            ("get_prefix", f.get_prefix_count, t.get_prefix_max),
         ] {
             insert(
                 &mut out,
@@ -81,6 +95,22 @@ pub fn collect(
             Some(f.start_line),
             Some(scaled(f.halstead_difficulty, 10)?),
             (scaled(t.halstead_difficulty_max, 10)?, 10),
+        )?;
+    }
+    // Error types are keyed `<defining file>::<Type>`.
+    for (item, value) in &rust.error_types {
+        let file = item
+            .rsplit_once("::")
+            .map_or(item.as_str(), |(file, _)| file);
+        out.entities.insert(item.clone());
+        insert(
+            &mut out,
+            "missing_error_impl",
+            item,
+            file,
+            None,
+            Some(u64::from(*value)),
+            (u64::from(t.missing_error_impl_max), 1),
         )?;
     }
     lint_items(
