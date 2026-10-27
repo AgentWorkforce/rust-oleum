@@ -559,8 +559,8 @@ mod tests {
             "a/src/lib.rs",
             "#![deny(warnings)]\n#[allow(dead_code)]\npub struct E;\n\
              pub fn f() -> Result<(), E> { Ok(()) }\n\
-             pub struct S;\nimpl S { pub fn get_b(&self) -> Box<u8> { x.unwrap() } }\n\
-             trait T { fn get_t(&self) -> Box<u8> { y.expect(\"why\") } }\n",
+             pub struct S;\nimpl S { pub fn get_b(&self) -> Rc<u8> { x.unwrap() } }\n\
+             trait T { fn get_t(&self) -> Rc<u8> { y.expect(\"why\") } }\n",
         );
         w(
             "b/src/lib.rs",
