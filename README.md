@@ -71,7 +71,7 @@ See [AGENTS.md](AGENTS.md) for the operating instructions and
 | Lint suppressions outside functions (`#![allow]`, on mods/impls/types) | 0 per file | source |
 | Unjustified suppressions outside functions | 0 per file | source |
 | Warning groups denied in source (`#![deny(warnings)]`, `#![deny(clippy::all)]`, ...) | 0 per file | source |
-| `Rc` / `RefCell` / `Arc` / `Box` / `Cell` / `Mutex` in a `pub` fn's parameter or return types | 0 per function | source |
+| `Rc` / `RefCell` / `Arc` / `Cell` / `Mutex` in a `pub` fn's parameter or return types, and `Box` as a whole parameter type | 0 per function | source |
 | `get_`-prefixed getters (`pub fn get_x(&self)`) | 0 per function | source |
 | Public error types (returned as `E` in a `pub fn`'s `Result<_, E>`) without an `std::error::Error` impl | 0 per type | source |
 | Test coverage | 100% | `--coverage` lcov file |
@@ -136,9 +136,13 @@ Where clippy is silent, rust-oleum checks a few
 items declared `pub` (not `pub(crate)`; module reachability isn't
 resolved, and trait-impl methods never count):
 
-- wrapper types (`Rc`, `RefCell`, `Arc`, `Box`, `Cell`, `Mutex`) in a `pub`
+- wrapper types (`Rc`, `RefCell`, `Arc`, `Cell`, `Mutex`) in a `pub`
   fn's parameter or return types, each occurrence counted
-  (`self: Arc<Self>` receivers excepted);
+  (`self: Arc<Self>` receivers excepted), and each parameter whose whole
+  type is a `Box` (`p: Box<T>` or `p: &Box<T>`; take `T` or `impl Trait`).
+  A returned `Box<dyn Trait>`, or one inside a parameter such as
+  `&[Box<dyn Trait>]`, is not counted: it carries a set of types chosen at
+  run time, which the caller cannot choose instead;
 - `pub fn get_x(&self)` getters (`get_mut`, `get_ref`, `get_unchecked`,
   `get_unchecked_mut` are fine);
 - error types defined in the crate and returned as `E` from a `pub` fn

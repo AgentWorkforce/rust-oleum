@@ -2,9 +2,13 @@
 //! Guidelines:
 //!
 //! - shared-ownership / interior-mutability wrappers (`Rc`, `RefCell`,
-//!   `Arc`, `Box`, `Cell`, `Mutex`) in the parameter or return types of a
-//!   `pub` fn leak an implementation choice into every caller (C-GENERIC,
-//!   C-STRUCT-PRIVATE);
+//!   `Arc`, `Cell`, `Mutex`) in the parameter or return types of a `pub` fn
+//!   leak an implementation choice into every caller (C-GENERIC,
+//!   C-STRUCT-PRIVATE). `Box` counts only as a whole parameter type
+//!   (`p: Box<T>`, `p: &Box<T>`), where `T` or `impl Trait` lets the caller
+//!   choose (C-GENERIC). A returned `Box<dyn Trait>`, or one inside a
+//!   parameter like `&[Box<dyn Trait>]`, is how a set of types chosen at run
+//!   time is passed, and has no caller-chosen alternative;
 //! - `get_`-prefixed getters (C-GETTER);
 //! - error types returned from `pub` fns that don't implement
 //!   `std::error::Error` (C-GOOD-ERR).
@@ -24,8 +28,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use syn::visit::Visit;
 
-/// Wrapper types that should stay out of public signatures.
-const WRAPPER_TYPES: &[&str] = &["Rc", "RefCell", "Arc", "Box", "Cell", "Mutex"];
+/// Wrapper types that should stay out of public signatures wherever they
+/// appear in one.
+const WRAPPER_TYPES: &[&str] = &["Rc", "RefCell", "Arc", "Cell", "Mutex"];
+
+/// Counted only as a whole parameter type; see the module docs.
+const BOX: &str = "Box";
 
 /// `get_` methods that the API Guidelines keep: they name what is gotten.
 const GETTER_EXCEPTIONS: &[&str] = &["get_mut", "get_ref", "get_unchecked", "get_unchecked_mut"];
@@ -38,8 +46,8 @@ fn is_pub(vis: &syn::Visibility) -> bool {
 }
 
 /// Wrapper types named in a `pub` fn's parameter and return types (each
-/// occurrence counts, nested ones too). `self: Arc<Self>` receivers are
-/// left alone.
+/// occurrence counts, nested ones too), plus each parameter whose whole type
+/// is a `Box`. `self: Arc<Self>` receivers are left alone.
 pub fn pub_wrapper_count(vis: &syn::Visibility, sig: &syn::Signature) -> u32 {
     if !is_pub(vis) {
         return 0;
@@ -47,11 +55,22 @@ pub fn pub_wrapper_count(vis: &syn::Visibility, sig: &syn::Signature) -> u32 {
     let mut v = WrapperVisitor::default();
     for input in &sig.inputs {
         if let syn::FnArg::Typed(arg) = input {
+            v.count += u32::from(is_box(&arg.ty));
             v.visit_type(&arg.ty);
         }
     }
     v.visit_return_type(&sig.output);
     v.count
+}
+
+/// Whether `ty`, behind any references and parentheses, is a `Box`.
+fn is_box(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Reference(r) => is_box(&r.elem),
+        syn::Type::Paren(p) => is_box(&p.elem),
+        syn::Type::Path(p) => p.path.segments.last().is_some_and(|s| s.ident == BOX),
+        _ => false,
+    }
 }
 
 #[derive(Default)]
@@ -285,7 +304,6 @@ mod tests {
             wrappers("pub fn f(a: Rc<A>, b: &RefCell<B>) -> Arc<C> {}"),
             3
         );
-        assert_eq!(wrappers("pub fn f(a: Vec<Box<dyn Fn()>>) {}"), 1);
         assert_eq!(
             wrappers("pub fn f(a: std::sync::Arc<std::sync::Mutex<u8>>) {}"),
             2
@@ -296,6 +314,26 @@ mod tests {
             wrappers("pub fn f(x: u8) -> u8 { let b = Box::new(x); *b }"),
             0
         );
+    }
+
+    #[test]
+    fn a_box_counts_only_as_a_whole_parameter_type() {
+        // A caller-chosen `T` or `impl Trait` would do.
+        assert_eq!(wrappers("pub fn f(a: Box<dyn Fn()>) {}"), 1);
+        assert_eq!(wrappers("pub fn f(a: std::boxed::Box<u8>) {}"), 1);
+        assert_eq!(wrappers("pub fn f(a: &Box<u8>, b: &mut (Box<u8>)) {}"), 2);
+        assert_eq!(wrappers("pub fn f(a: Box<Rc<u8>>) {}"), 2);
+        // Run-time-chosen types, with no caller-chosen alternative.
+        assert_eq!(wrappers("pub fn f() -> Box<dyn Fn()> {}"), 0);
+        assert_eq!(wrappers("pub fn f() -> Result<Vec<Box<dyn T>>> {}"), 0);
+        assert_eq!(
+            wrappers("pub fn f(a: &[Box<dyn T>], b: Vec<Box<dyn T>>) {}"),
+            0
+        );
+        assert_eq!(wrappers("pub fn f(a: Option<Box<dyn T>>) {}"), 0);
+        assert_eq!(wrappers("pub fn f(a: impl Fn()) {}"), 0);
+        // The other wrappers still count wherever they appear.
+        assert_eq!(wrappers("pub fn f() -> Box<Rc<u8>> {}"), 1);
     }
 
     #[test]

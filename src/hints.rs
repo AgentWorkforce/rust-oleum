@@ -120,9 +120,10 @@ const HINTS: &[(&str, &str)] = &[
     ),
     (
         "pub_wrapper",
-        "take `&T`, `&mut T` or `T` and let callers choose ownership; keep `Rc`/`Arc`/`RefCell` \
+        "take `&T`, `&mut T`, `T` or `impl Trait` and let callers choose ownership (a `Box` \
+         parameter becomes `impl Trait` or `T`, boxed inside); keep `Rc`/`Arc`/`RefCell` \
          inside the type; don't just hide the wrapper behind a type alias \
-         (BeautifulRust §3, Rust API Guidelines C-CALLER-CONTROL)",
+         (BeautifulRust §3, Rust API Guidelines C-CALLER-CONTROL, C-GENERIC)",
     ),
     (
         "get_prefix",
