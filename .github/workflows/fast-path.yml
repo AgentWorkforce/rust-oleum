@@ -1,0 +1,130 @@
+# Fast path: check and package rust-oleum on Blacksmith runners, outside the
+# shared GitHub-hosted queue. Anyone with write access (people or agents) may
+# start it; nothing runs until Khaliq approves the fast-path environment.
+#
+# It runs the same checks as ci.yml (fmt, clippy -D warnings, tests, coverage
+# and the dogfooded quality gate), then builds the release binary and the
+# `cargo package` crate and uploads both as a workflow artifact. It does not
+# publish to crates.io (release.yml does that through Trusted Publishing) and
+# never creates a tag or GitHub release.
+name: fast-path
+run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to check (a PR branch is fine)
+        required: true
+        default: main
+      reason:
+        description: Why this needs the fast path
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: fast-path-${{ inputs.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    environment: fast-path
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy,llvm-tools-preview
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-llvm-cov
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Install cargo-llvm-cov
+        run: command -v cargo-llvm-cov || cargo install cargo-llvm-cov --locked
+
+      - name: Coverage (lcov)
+        run: cargo llvm-cov --lcov --output-path lcov.info
+
+      - name: Clippy JSON log
+        run: |
+          touch src/main.rs
+          cargo clippy --all-targets --message-format=json > clippy-log.json
+
+      - name: Dogfood the gate
+        run: >
+          cargo run --
+          --coverage lcov.info
+          --clippy-log clippy-log.json
+          --github-summary "$GITHUB_STEP_SUMMARY"
+
+  package:
+    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+      - name: Setup Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package crate (verifies it builds from the packaged sources)
+        run: cargo package --locked
+      - name: Stage
+        id: stage
+        env:
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          mkdir -p fast-dist
+          cp target/release/rust-oleum "fast-dist/rust-oleum-x86_64-unknown-linux-gnu"
+          cp "target/package/rust-oleum-$version.crate" fast-dist/
+          (cd fast-dist && sha256sum ./* > SHA256SUMS)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          ls -l fast-dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-oleum-fast-${{ needs.check.outputs.sha }}
+          path: fast-dist/*
+          if-no-files-found: error
+      - name: Summary
+        env:
+          REF: ${{ inputs.ref }}
+          SHA: ${{ needs.check.outputs.sha }}
+          REASON: ${{ inputs.reason }}
+          VERSION: ${{ steps.stage.outputs.version }}
+        run: |
+          {
+            echo "### rust-oleum fast path"
+            echo "- ref: \`$REF\` at \`$SHA\`"
+            echo "- reason: $REASON"
+            echo "- crate version in Cargo.toml: \`$VERSION\` (not published to crates.io)"
+            echo "- artifact: \`rust-oleum-fast-$SHA\`"
+            sed 's/^/  - /' fast-dist/SHA256SUMS
+          } >> "$GITHUB_STEP_SUMMARY"
