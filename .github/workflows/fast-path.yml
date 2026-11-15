@@ -21,8 +21,10 @@ on:
         required: true
 permissions:
   contents: read
+# run_id keeps each dispatch in its own group: a ref-keyed group would let
+# a later dispatch cancel one that is still waiting for approval.
 concurrency:
-  group: fast-path-${{ inputs.ref }}
+  group: fast-path-${{ inputs.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
   check:
@@ -40,7 +42,8 @@ jobs:
       - name: Setup Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy,llvm-tools-preview
 
-      - uses: actions/cache@v4
+      # Restore only: unreviewed refs must not save into CI's cache.
+      - uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -85,13 +88,6 @@ jobs:
           ref: ${{ needs.check.outputs.sha }}
       - name: Setup Rust
         run: rustup toolchain install stable --profile minimal
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
       - name: Build release binary
         run: cargo build --release --locked
       - name: Package crate (verifies it builds from the packaged sources)
