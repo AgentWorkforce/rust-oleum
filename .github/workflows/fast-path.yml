@@ -53,10 +53,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
       - name: Install cargo-llvm-cov
         run: command -v cargo-llvm-cov || cargo install cargo-llvm-cov --locked
@@ -103,7 +103,8 @@ jobs:
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           mkdir -p fast-dist
-          cp target/release/rust-oleum "fast-dist/rust-oleum-x86_64-unknown-linux-gnu"
+          # Tar the binary: upload-artifact does not keep the executable bit.
+          tar -C target/release -czf "fast-dist/rust-oleum-$version-x86_64-unknown-linux-gnu.tar.gz" rust-oleum
           cp "target/package/rust-oleum-$version.crate" fast-dist/
           (cd fast-dist && sha256sum ./* > SHA256SUMS)
           echo "version=$version" >> "$GITHUB_OUTPUT"
